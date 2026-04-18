@@ -38,11 +38,14 @@ class TestCRUD:
         assert r.status_code == 200
 
     def test_search_hot(self):
-        r = post("/memories/search", {"query": "REST test", "source": "hot"})
+        # Add a unique entry then search for it
+        tag = f"search_hot_{int(time.time())}"
+        post("/memories", {"target": "memory", "content": tag})
+        r = post("/memories/search", {"query": tag, "source": "hot"})
         assert r.status_code == 200
         data = r.json()["data"]
         hot = data.get("hot", [])
-        assert any("REST test" in str(m) for m in hot)
+        assert any(tag in m.get("content", "") for m in hot)
 
     def test_replace(self):
         r = post("/memories/replace", {
@@ -76,8 +79,11 @@ class TestCRUD:
         assert r.status_code == 200
 
     def test_promote(self):
-        # Find a cold memory to promote
-        r = post("/memories/search", {"query": "REST test", "source": "cold"})
+        # Add, archive, then promote
+        tag = f"promote_test_{int(time.time())}"
+        post("/memories", {"target": "memory", "content": tag})
+        post("/memories/archive", {"target": "memory", "old_text": tag})
+        r = post("/memories/search", {"query": tag, "source": "cold"})
         cold = r.json()["data"].get("cold", [])
         if cold:
             mid = cold[0].get("id") or cold[0].get("memory_id")
@@ -223,7 +229,7 @@ class TestConsistency:
         post("/memories", {"content": content})
         r = post("/memories/search", {"query": content, "source": "hot"})
         hot = r.json()["data"].get("hot", [])
-        assert any(content in str(m) for m in hot), f"Written content not found: {hot}"
+        assert any(content in m.get("content", "") for m in hot), f"Written content not found in hot: {hot}"
 
     def test_remove_then_search(self):
         tag = f"ephemeral_{int(time.time())}"
@@ -239,10 +245,11 @@ class TestConsistency:
         post("/memories/archive", {"target": "memory", "old_text": tag})
         # Not in hot
         r_hot = post("/memories/search", {"query": tag, "source": "hot"})
-        assert not any(tag in str(m) for m in r_hot.json()["data"].get("hot", []))
+        assert not any(tag in m.get("content", "") for m in r_hot.json()["data"].get("hot", []))
         # In cold
         r_cold = post("/memories/search", {"query": tag, "source": "cold"})
-        assert any(tag in str(m) for m in r_cold.json()["data"].get("cold", []))
+        cold = r_cold.json()["data"].get("cold", [])
+        assert any(tag in m.get("content", "") for m in cold), f"Archived entry not in cold: {cold}"
 
 
 # ═══════════════════════════════════════════
