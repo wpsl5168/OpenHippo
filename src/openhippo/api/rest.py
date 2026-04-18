@@ -55,6 +55,7 @@ class SearchRequest(BaseModel):
     target: str | None = None
     source: str = Field("all", description="'all', 'hot', 'cold'")
     limit: int = Field(20, ge=1, le=100)
+    mode: str = Field("hybrid", description="'hybrid' (FTS+vec RRF), 'fts', 'vector'")
 
 class ArchiveRequest(BaseModel):
     target: str = Field("memory")
@@ -72,7 +73,7 @@ def add_memory(req: AddRequest):
 
 @app.post("/v1/memories/search")
 def search_memories(req: SearchRequest):
-    return {"data": _engine().search(req.query, req.target, req.source, req.limit)}
+    return {"data": _engine().search(req.query, req.target, req.source, req.limit, req.mode)}
 
 @app.post("/v1/memories/replace")
 def replace_memory(req: ReplaceRequest):
@@ -121,4 +122,9 @@ def get_logs(limit: int = 50):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "0.1.0"}
+    return {"status": "ok", "version": "0.2.0"}
+
+@app.post("/v1/embeddings/backfill")
+def backfill_embeddings():
+    """Generate embeddings for all cold memories missing them."""
+    return {"data": _engine().embed_all_cold()}

@@ -1,10 +1,13 @@
-"""SQLite + FTS5 storage backend for OpenHippo."""
+"""SQLite + FTS5 + sqlite-vec storage backend for OpenHippo."""
 
 import sqlite3
+import struct
 import time
 import uuid
 from pathlib import Path
 from typing import Any
+
+import sqlite_vec
 
 DEFAULT_DB_PATH = Path.home() / ".openhippo" / "memory.db"
 
@@ -64,11 +67,26 @@ CREATE TABLE IF NOT EXISTS consolidation_log (
     created_at  REAL NOT NULL DEFAULT (unixepoch('now'))
 );
 
+-- Embedding storage for cold memories
+CREATE TABLE IF NOT EXISTS cold_embeddings (
+    memory_id   TEXT PRIMARY KEY REFERENCES cold_memory(id) ON DELETE CASCADE,
+    embedding   BLOB NOT NULL,
+    model       TEXT NOT NULL DEFAULT 'nomic-embed-text',
+    created_at  REAL NOT NULL DEFAULT (unixepoch('now'))
+);
+
 -- Schema version
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY
 );
-INSERT OR IGNORE INTO schema_version VALUES (1);
+INSERT OR IGNORE INTO schema_version VALUES (2);
+"""
+
+VECTOR_TABLE_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS cold_memory_vec USING vec0(
+    memory_id TEXT PRIMARY KEY,
+    embedding float[768]
+);
 """
 
 
@@ -84,6 +102,9 @@ class Storage:
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
             self._conn = sqlite3.connect(str(self.db_path), timeout=10, check_same_thread=False)
+            self._conn.enable_load_extension(True)
+            sqlite_vec.load(self._conn)
+            self._conn.enable_load_extension(False)
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
@@ -92,6 +113,8 @@ class Storage:
     def _init_db(self) -> None:
         conn = self._get_conn()
         conn.executescript(SCHEMA_SQL)
+        # vec0 virtual table must be created outside executescript
+        conn.executescript(VECTOR_TABLE_SQL)
         conn.commit()
 
     def close(self) -> None:
@@ -251,6 +274,8 @@ class Storage:
         if not row:
             return {"error": f"Memory {memory_id} not found"}
         conn.execute("DELETE FROM cold_memory WHERE id=?", (memory_id,))
+        # Clean up embedding
+        self.vec_delete(memory_id)
         conn.commit()
         return {"id": memory_id, "status": "deleted"}
 
@@ -290,6 +315,66 @@ class Storage:
         self._log("promote", memory_id, {"hot_id": hot["id"]})
         return {"status": "promoted", "cold_id": memory_id, "hot_id": hot["id"]}
 
+    # ── Vector Operations ──
+
+    @staticmethod
+    def _serialize_vec(vec: list[float]) -> bytes:
+        """Serialize float list to little-endian bytes for sqlite-vec."""
+        return struct.pack(f"<{len(vec)}f", *vec)
+
+    def vec_store(self, memory_id: str, embedding: list[float]) -> None:
+        """Store embedding for a cold memory entry."""
+        conn = self._get_conn()
+        blob = self._serialize_vec(embedding)
+        # Store raw embedding
+        conn.execute(
+            "INSERT OR REPLACE INTO cold_embeddings (memory_id, embedding, created_at) VALUES (?,?,?)",
+            (memory_id, blob, time.time()),
+        )
+        # Store in vec0 index
+        conn.execute(
+            "INSERT OR REPLACE INTO cold_memory_vec (memory_id, embedding) VALUES (?,?)",
+            (memory_id, blob),
+        )
+        conn.commit()
+
+    def vec_delete(self, memory_id: str) -> None:
+        """Remove embedding for a cold memory entry."""
+        conn = self._get_conn()
+        conn.execute("DELETE FROM cold_embeddings WHERE memory_id=?", (memory_id,))
+        conn.execute("DELETE FROM cold_memory_vec WHERE memory_id=?", (memory_id,))
+        conn.commit()
+
+    def vec_search(self, query_embedding: list[float], target: str | None = None,
+                   limit: int = 20) -> list[dict]:
+        """Vector similarity search on cold memory. Returns results with distance score."""
+        conn = self._get_conn()
+        blob = self._serialize_vec(query_embedding)
+        # vec0 KNN query
+        rows = conn.execute(
+            """SELECT v.memory_id, v.distance, cm.*
+               FROM cold_memory_vec v
+               JOIN cold_memory cm ON cm.id = v.memory_id
+               WHERE v.embedding MATCH ? AND k = ?""",
+            (blob, limit * 2 if target else limit),
+        ).fetchall()
+
+        results = []
+        for r in rows:
+            d = dict(r)
+            if target and d.get("target") != target:
+                continue
+            d["vec_distance"] = d.pop("distance", None)
+            results.append(d)
+            if len(results) >= limit:
+                break
+        return results
+
+    def vec_count(self) -> int:
+        """Count embedded cold memories."""
+        conn = self._get_conn()
+        return conn.execute("SELECT COUNT(*) FROM cold_embeddings").fetchone()[0]
+
     # ── Stats ──
 
     def stats(self) -> dict:
@@ -302,6 +387,7 @@ class Storage:
             "cold_count": self.cold_count(),
             "cold_memory_count": self.cold_count("memory"),
             "cold_user_count": self.cold_count("user"),
+            "vec_count": self.vec_count(),
             "db_size_kb": self.db_path.stat().st_size // 1024 if self.db_path.exists() else 0,
         }
 
