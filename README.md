@@ -12,9 +12,20 @@
 
 OpenHippo is an open-source, local-first memory engine designed for AI agents. It provides persistent, searchable memory with hot/cold tiering, hybrid retrieval (full-text + semantic vector search), and a clean REST API — all backed by SQLite. No cloud dependency. No vendor lock-in. Your data stays on your machine.
 
-## Why OpenHippo?
+## The Problem
 
-Most AI agent memory solutions are either cloud-hosted (privacy concerns) or tightly coupled to a specific framework. OpenHippo takes a different approach:
+Today's AI agents have amnesia. Every conversation starts from scratch. The "memory" solutions that exist are either cloud-hosted (your data goes to someone else's server), locked into a specific framework, or require the agent itself to decide what to remember — which is like asking you to consciously manage your own hippocampus.
+
+**We believe memory should be a separate, autonomous system** — just like the human brain. Your hippocampus doesn't ask for permission to form memories. It runs in the background, silently encoding experiences, consolidating knowledge during sleep, and surfacing relevant context when you need it.
+
+OpenHippo is that hippocampus for AI agents:
+- **Decoupled** — Memory is not a feature inside the agent; it's an independent service. Any agent, any framework, any VM can connect.
+- **Automatic** — Hook into the agent's lifecycle. Memories are captured and recalled without explicit commands.
+- **Transparent** — Unlike a real hippocampus, this one is fully auditable. Users can inspect, edit, and delete any memory at any time. Zero opacity.
+
+## Why OpenHippo over alternatives?
+
+Most agent memory solutions (Mem0, Zep, etc.) are either cloud-hosted or tightly coupled to a specific framework. OpenHippo takes a different approach:
 
 - **Local-first** — SQLite + [sqlite-vec](https://github.com/asg017/sqlite-vec) for storage and vector search. No external database needed.
 - **Privacy by design** — All data stays on disk. Embedding runs locally via [sentence-transformers](https://sbert.net/) or Ollama.
