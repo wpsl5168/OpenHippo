@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..core.engine import HippoEngine
@@ -180,6 +181,72 @@ def delete_memory(memory_id: str):
 @app.get("/health")
 def health():
     return {"status": "ok", "version": "0.2.0"}
+
+
+@app.get("/v1/export")
+def export_memories(
+    format: str = "json",
+    target: str | None = None,
+    agent_id: str | None = None,
+    since: float | None = None,
+    until: float | None = None,
+    tags: str | None = None,
+    include_embeddings: bool = True,
+):
+    """Export all memories as JSON, JSONL, Markdown, or CSV.
+    
+    One-click full export with schema versioning for zero-lock-in portability.
+    """
+    import io
+    from ..core.export import export_json, export_markdown, export_csv
+
+    e = _engine()
+    tag_list = [t.strip() for t in tags.split(",")] if tags else None
+
+    if format == "json":
+        content = export_json(
+            e.storage, target=target, since=since, until=until,
+            tags=tag_list, include_embeddings=include_embeddings,
+            agent_id=agent_id,
+        )
+        return StreamingResponse(
+            iter([content]),
+            media_type="application/json",
+            headers={"Content-Disposition": "attachment; filename=memories.json"},
+        )
+    elif format == "jsonl":
+        buf = io.StringIO()
+        export_json(
+            e.storage, output=buf, target=target, since=since, until=until,
+            tags=tag_list, include_embeddings=include_embeddings,
+            agent_id=agent_id, jsonlines=True,
+        )
+        return StreamingResponse(
+            iter([buf.getvalue()]),
+            media_type="application/x-ndjson",
+            headers={"Content-Disposition": "attachment; filename=memories.jsonl"},
+        )
+    elif format == "markdown" or format == "md":
+        content = export_markdown(
+            e.storage, target=target, since=since, until=until, tags=tag_list,
+        )
+        return StreamingResponse(
+            iter([content]),
+            media_type="text/markdown",
+            headers={"Content-Disposition": "attachment; filename=memories.md"},
+        )
+    elif format == "csv":
+        buf = io.StringIO()
+        export_csv(
+            e.storage, output=buf, target=target, since=since, until=until, tags=tag_list,
+        )
+        return StreamingResponse(
+            iter([buf.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=memories.csv"},
+        )
+    else:
+        raise HTTPException(400, f"Unsupported format: {format}. Use json, jsonl, markdown, or csv.")
 
 @app.post("/v1/embeddings/backfill")
 def backfill_embeddings():
