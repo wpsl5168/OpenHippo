@@ -252,3 +252,18 @@ def export_memories(
 def backfill_embeddings():
     """Generate embeddings for all cold memories missing them."""
     return {"data": _engine().embed_all_cold()}
+
+
+class ImportRequest(BaseModel):
+    data: dict = Field(..., description="Exported JSON document (with header + memories)")
+    reembed: bool = Field(False, description="Force re-compute embeddings")
+    dry_run: bool = Field(False, description="Preview only, don't write")
+
+
+@app.post("/v1/import")
+def import_memories(req: ImportRequest):
+    """Import memories from an export file. Detects embedding backend changes."""
+    from ..core.importer import import_json
+    e = _engine()
+    result = import_json(e.storage, req.data, reembed=req.reembed, dry_run=req.dry_run)
+    return {"data": result}

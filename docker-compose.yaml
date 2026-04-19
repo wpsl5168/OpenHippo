@@ -11,8 +11,11 @@ services:
       - hippo_data:/data
     environment:
       - HIPPO_AUTH_TOKEN=${HIPPO_AUTH_TOKEN:-}
-      - HIPPO_EMBEDDING_PROVIDER=local
+      - HIPPO_EMBEDDING_PROVIDER=ollama
+      - HIPPO_EMBEDDING_OLLAMA_BASE_URL=http://host.docker.internal:11434
       - HIPPO_LOG_LEVEL=INFO
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8200/health')"]
       interval: 30s
