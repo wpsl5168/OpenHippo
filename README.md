@@ -74,7 +74,18 @@ results = hippo.search("editor preferences")
 
 ## Project Status
 
-🚧 **Early development** — contributions welcome!
+🚧 **Early development** — see [Progress Report](docs/PROGRESS.md) for details.
+
+**Completed (10/26 PRD features):**
+- ✅ Core CRUD (write/search/delete/replace) with semantic dedup
+- ✅ Hot/cold memory tiers with auto-eviction
+- ✅ FTS5 + sqlite-vec hybrid search (RRF fusion)
+- ✅ REST API (17 endpoints) + MCP + CLI
+- ✅ Embedding abstraction (Ollama / SentenceTransformer — no external API needed)
+- ✅ Unified YAML + env config system
+- ✅ 55 tests passing
+
+**Next up:** Bearer Token auth → Docker packaging → Multi-VM deployment
 
 See the [PRD](docs/PRD.md) for the full roadmap.
 
