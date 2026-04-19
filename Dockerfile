@@ -2,14 +2,15 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install dependencies first (cache layer)
 COPY pyproject.toml README.md ./
 COPY src/ src/
-RUN pip install --no-cache-dir ".[local]"
 
-# Default config directory
+# Install core only (no torch/sentence-transformers — use Ollama for embeddings in Docker)
+RUN pip install --no-cache-dir .
+
 RUN mkdir -p /data
 ENV HIPPO_DB_PATH=/data/memory.db
+ENV HIPPO_EMBEDDING_PROVIDER=ollama
 
 EXPOSE 8200
 
