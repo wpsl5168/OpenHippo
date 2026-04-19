@@ -10,7 +10,7 @@
 
 ---
 
-OpenHippo is an open-source, local-first memory engine designed for AI agents. It provides persistent, searchable memory with hot/cold tiering, hybrid retrieval (full-text + semantic vector search), and a clean REST + MCP interface — all backed by SQLite. No cloud dependency. No vendor lock-in. Your data stays on your machine.
+OpenHippo is an open-source, local-first memory engine designed for AI agents. It provides persistent, searchable memory with hot/cold tiering, hybrid retrieval (full-text + semantic vector search), and a clean REST API — all backed by SQLite. No cloud dependency. No vendor lock-in. Your data stays on your machine.
 
 ## Why OpenHippo?
 
@@ -21,31 +21,38 @@ Most AI agent memory solutions are either cloud-hosted (privacy concerns) or tig
 - **Hot/cold tiering** — Frequently accessed memories stay "hot" (fast, capacity-limited); older entries archive to "cold" storage with full vector indexing.
 - **Hybrid retrieval** — Combines FTS5 full-text search with vector similarity via Reciprocal Rank Fusion (RRF).
 - **Semantic deduplication** — Prevents storing near-duplicate entries using both exact hash and vector distance checks.
-- **Multi-protocol** — REST API, MCP (Model Context Protocol) server, and CLI — use whichever fits your stack.
+- **Agent integration** — Hook/plugin system for seamless, zero-config memory sync with AI agents. Also exposes a REST API for direct access.
 - **Auditable** — Full CRUD operations on stored memories. Timeline browsing. Operation logs. Users can inspect, edit, and delete any memory.
 
 ## Architecture
 
 ```
-┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-│   REST API   │  │  MCP Server  │  │     CLI      │
-│  (FastAPI)   │  │  (stdio/sse) │  │   (click)    │
-└──────┬───────┘  └──────┬───────┘  └──────┬───────┘
-       │                 │                 │
-       └─────────┬───────┘─────────────────┘
-                 │
-          ┌──────▼───────┐
-          │  HippoEngine │  ← core logic: dedup, tiering, search
-          └──────┬───────┘
-                 │
-     ┌───────────┼───────────┐
-     │           │           │
-┌────▼────┐ ┌───▼────┐ ┌────▼─────┐
-│ Storage │ │Embedding│ │  Config  │
-│ (SQLite │ │Provider │ │  (YAML)  │
-│  +vec)  │ │ (local/ │ │          │
-│         │ │ ollama) │ │          │
-└─────────┘ └────────┘ └──────────┘
+┌─────────────────────────────────────────────────┐
+│              AI Agent (Hermes, etc.)             │
+└────────┬──────────────────────────┬──────────────┘
+         │ hooks (auto-sync)        │ REST API
+         ▼                          ▼
+┌──────────────┐            ┌──────────────┐
+│  Plugin/Hook │            │   REST API   │
+│  (pre_llm    │            │  (FastAPI)   │
+│   post_llm   │            │  + Bearer    │
+│   post_tool) │            │    Auth      │
+└──────┬───────┘            └──────┬───────┘
+       │                          │
+       └────────────┬─────────────┘
+                    │
+             ┌──────▼───────┐
+             │  HippoEngine │  ← dedup, tiering, search
+             └──────┬───────┘
+                    │
+        ┌───────────┼───────────┐
+        │           │           │
+  ┌─────▼───┐ ┌────▼───┐ ┌────▼─────┐
+  │ Storage  │ │Embedding│ │  Config  │
+  │ (SQLite  │ │Provider │ │  (YAML)  │
+  │  +vec)   │ │ (local/ │ │          │
+  │          │ │ ollama) │ │          │
+  └──────────┘ └────────┘ └──────────┘
 ```
 
 ## Quick Start
@@ -161,20 +168,32 @@ HIPPO_SERVER_PORT=9000           # Custom port
 
 Both backends use `nomic-embed-text-v1.5` (768 dimensions) by default for consistent vector quality.
 
-## MCP Integration
+## Agent Integration (Hook/Plugin)
 
-OpenHippo implements the [Model Context Protocol](https://modelcontextprotocol.io/) for direct integration with MCP-compatible AI agents:
+OpenHippo integrates with AI agents via a **hook/plugin system** — no manual API calls needed. The agent's memory operations are automatically mirrored to OpenHippo in the background.
 
-```json
-{
-  "mcpServers": {
-    "openhippo": {
-      "command": "openhippo",
-      "args": ["mcp"]
-    }
-  }
-}
+**Three hooks, fully automatic:**
+
+| Hook | Trigger | What it does |
+|------|---------|-------------|
+| `pre_llm_call` | Before each LLM request | Semantic search → inject relevant memories as context |
+| `post_llm_call` | After LLM response | Extract memorable facts from conversation (rule-based) |
+| `post_tool_call` | After `memory` tool use | Mirror add/replace/remove operations to OpenHippo |
+
+**Setup (Hermes Agent example):**
+
+```bash
+# Copy plugin to agent's plugin directory
+cp -r plugin/hermes ~/.hermes/plugins/openhippo
+
+# Configure endpoint (local or remote)
+export HIPPO_BASE_URL=http://localhost:8200   # or remote server
+export HIPPO_TOKEN=your-secret-token          # if auth enabled
+
+# Restart your agent — done. Memory sync is fully automatic.
 ```
+
+**Offline resilience:** When OpenHippo is unreachable, writes are cached to a local WAL (Write-Ahead Log) and replayed automatically on reconnection.
 
 ## Development
 
@@ -200,12 +219,13 @@ mypy src/
 - [x] Hybrid retrieval with RRF fusion
 - [x] Semantic deduplication
 - [x] REST API with full CRUD
-- [x] MCP server (stdio)
+- [x] Hook/plugin agent integration (auto-sync)
 - [x] Audit log and memory timeline
 - [x] Pluggable embedding backends (local / Ollama)
 - [x] Unified YAML + env config system
-- [ ] Bearer token authentication
-- [ ] Docker image and compose deployment
+- [x] Bearer token authentication
+- [x] Docker image and compose deployment
+- [x] Remote agent connection (multi-VM support)
 - [ ] Multi-tenant support
 - [ ] Web UI for memory inspection
 - [ ] Scheduled memory consolidation (auto-summarize)
