@@ -120,6 +120,52 @@ def get_stats():
 def get_logs(limit: int = 50):
     return {"data": _engine().get_logs(limit)}
 
+class UpdateMemoryRequest(BaseModel):
+    content: str = Field(..., description="New content for the memory")
+
+
+# ── Audit APIs (CRUD by ID + timeline) ──
+
+@app.get("/v1/memories/timeline")
+def memory_timeline(target: str | None = None, limit: int = 50, offset: int = 0):
+    """Browse cold memories ordered by creation time (newest first)."""
+    return {"data": _engine().cold_timeline(target, limit, offset)}
+
+
+@app.get("/v1/memories/{memory_id}")
+def get_memory(memory_id: str):
+    """Get a single memory by ID (checks hot first, then cold)."""
+    e = _engine()
+    # Check hot
+    for target in ("memory", "user"):
+        for entry in e.get_hot(target):
+            if entry["id"] == memory_id:
+                return {"data": {**entry, "source": "hot"}}
+    # Check cold
+    cold = e.cold_get(memory_id)
+    if cold:
+        return {"data": {**cold, "source": "cold"}}
+    raise HTTPException(404, f"Memory {memory_id} not found")
+
+
+@app.put("/v1/memories/{memory_id}")
+def update_memory(memory_id: str, req: UpdateMemoryRequest):
+    """Update a cold memory by ID."""
+    result = _engine().cold_update(memory_id, req.content)
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return {"data": result}
+
+
+@app.delete("/v1/memories/{memory_id}")
+def delete_memory(memory_id: str):
+    """Delete a cold memory by ID."""
+    result = _engine().cold_delete(memory_id)
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return {"data": result}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "version": "0.2.0"}

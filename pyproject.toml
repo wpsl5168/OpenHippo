@@ -28,6 +28,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+local = [
+    "sentence-transformers>=3.0",
+    "einops",
+]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",

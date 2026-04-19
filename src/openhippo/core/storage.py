@@ -279,6 +279,39 @@ class Storage:
         conn.commit()
         return {"id": memory_id, "status": "deleted"}
 
+    def cold_update(self, memory_id: str, content: str) -> dict:
+        conn = self._get_conn()
+        row = conn.execute("SELECT id FROM cold_memory WHERE id=?", (memory_id,)).fetchone()
+        if not row:
+            return {"error": f"Memory {memory_id} not found"}
+        conn.execute(
+            "UPDATE cold_memory SET content=?, updated_at=unixepoch('now') WHERE id=?",
+            (content, memory_id),
+        )
+        conn.commit()
+        # Refresh embedding
+        from .embedding import get_embedding
+        vec = get_embedding(content)
+        if vec:
+            self.vec_delete(memory_id)
+            self._vec_insert(memory_id, vec)
+        return {"id": memory_id, "status": "updated"}
+
+    def cold_timeline(self, target: str | None = None, limit: int = 50, offset: int = 0) -> list[dict]:
+        """Get cold memories ordered by creation time (newest first)."""
+        conn = self._get_conn()
+        if target:
+            rows = conn.execute(
+                "SELECT * FROM cold_memory WHERE target=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (target, limit, offset),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM cold_memory ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def cold_count(self, target: str | None = None) -> int:
         conn = self._get_conn()
         if target:
@@ -345,26 +378,40 @@ class Storage:
         conn.execute("DELETE FROM cold_memory_vec WHERE memory_id=?", (memory_id,))
         conn.commit()
 
+    # L2 distance threshold for relevance filtering.
+    # For nomic-embed-text (768d, normalized), empirically:
+    #   < 1.0 = highly relevant, 1.0-1.3 = relevant, 1.3-1.5 = borderline
+    #   > 1.5 = likely irrelevant.  (L2 on unit vectors: d=√(2-2cos), so d=1.5 ≈ cos<0.0)
+    VEC_DISTANCE_THRESHOLD = 1.0
+
     def vec_search(self, query_embedding: list[float], target: str | None = None,
                    limit: int = 20) -> list[dict]:
-        """Vector similarity search on cold memory. Returns results with distance score."""
+        """Vector similarity search on cold memory. Returns results with distance score.
+        
+        Results with L2 distance > VEC_DISTANCE_THRESHOLD are filtered out as irrelevant.
+        """
         conn = self._get_conn()
         blob = self._serialize_vec(query_embedding)
-        # vec0 KNN query
+        # vec0 KNN query — fetch extra candidates for target filtering + threshold filtering
+        fetch_k = max(limit * 3, 30)
         rows = conn.execute(
             """SELECT v.memory_id, v.distance, cm.*
                FROM cold_memory_vec v
                JOIN cold_memory cm ON cm.id = v.memory_id
                WHERE v.embedding MATCH ? AND k = ?""",
-            (blob, limit * 2 if target else limit),
+            (blob, fetch_k),
         ).fetchall()
 
         results = []
         for r in rows:
             d = dict(r)
+            distance = d.pop("distance", None)
             if target and d.get("target") != target:
                 continue
-            d["vec_distance"] = d.pop("distance", None)
+            # Filter out irrelevant results beyond distance threshold
+            if distance is not None and distance > self.VEC_DISTANCE_THRESHOLD:
+                continue
+            d["vec_distance"] = distance
             results.append(d)
             if len(results) >= limit:
                 break

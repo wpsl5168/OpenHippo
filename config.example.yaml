@@ -1,0 +1,31 @@
+# OpenHippo Configuration
+# Override with environment variables: HIPPO_HOST, HIPPO_PORT, HIPPO_DB_PATH, etc.
+
+server:
+  host: "127.0.0.1"   # 0.0.0.0 for remote access
+  port: 8200
+
+storage:
+  db_path: "~/.hippocampus/memory.db"
+
+embedding:
+  provider: "auto"     # auto | ollama | local | openai
+  ollama:
+    base_url: "http://127.0.0.1:11434"
+    model: "nomic-embed-text"
+  local:
+    model: "nomic-ai/nomic-embed-text-v1.5"
+    device: "cpu"
+  # openai:
+  #   model: "text-embedding-3-small"
+  #   api_key: ""
+
+auth:
+  enabled: false
+  # tokens:
+  #   - name: "hermes-agent"
+  #     token: "hpc_your_token_here"
+  #     scopes: ["memory:read", "memory:write"]
+
+logging:
+  level: "INFO"

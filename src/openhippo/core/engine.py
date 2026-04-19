@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,9 @@ class HippoEngine:
     HOT_USER_LIMIT = 2750
 
     def __init__(self, db_path: str | Path | None = None):
+        if db_path is None:
+            from .config import get_config, get
+            db_path = get(get_config(), "storage.db_path")
         self.storage = Storage(db_path or DEFAULT_DB_PATH)
 
     def close(self) -> None:
@@ -27,18 +31,105 @@ class HippoEngine:
 
     # ── F1: Memory Write ──
 
+    # Dedup thresholds
+    EXACT_DEDUP = True
+    SEMANTIC_DEDUP_THRESHOLD = 0.92
+
+    @staticmethod
+    def _normalize_content(content: str) -> str:
+        """Normalize content for dedup: strip whitespace and known prefixes."""
+        s = content.strip()
+        for prefix in ("[hermes-mirror] ", "[migrated-cold] ", "[migrated-hot] "):
+            if s.startswith(prefix):
+                s = s[len(prefix):]
+        return s
+
     def add(self, target: str, content: str) -> dict:
-        """Add a memory entry to hot storage.
-        
-        Args:
-            target: 'memory' or 'user'
-            content: memory content text
+        """Add a memory entry to hot storage with dedup.
+
+        Dedup pipeline:
+        1. Exact match (SHA-256 of normalized content) → skip
+        2. Semantic match (cosine > 0.92 against cold) → skip
+        3. Otherwise → create new entry
+
         Returns:
-            {"id": str, "status": "created"}
+            {"id": str, "status": "created"/"duplicate"/"similar", ...}
         """
         self._validate_target(target)
+        normalized = self._normalize_content(content)
+
+        # ── Exact dedup: check hot + cold ──
+        if self.EXACT_DEDUP:
+            content_hash = hashlib.sha256(normalized.encode()).hexdigest()
+            # Check hot
+            for entry in self.storage.hot_list(target):
+                if hashlib.sha256(self._normalize_content(entry["content"]).encode()).hexdigest() == content_hash:
+                    return {"id": entry["id"], "status": "duplicate", "reason": "exact_hot"}
+            # Check cold
+            conn = self.storage._get_conn()
+            # Use LIKE as fast pre-filter, then exact hash
+            rows = conn.execute(
+                "SELECT id, content FROM cold_memory WHERE target=?", (target,)
+            ).fetchall()
+            for row in rows:
+                if hashlib.sha256(self._normalize_content(row["content"]).encode()).hexdigest() == content_hash:
+                    return {"id": row["id"], "status": "duplicate", "reason": "exact_cold"}
+
+        # ── Semantic dedup: check cold embeddings ──
+        vec = get_embedding(normalized)
+        if vec:
+            similar = self.storage.vec_search(vec, target, limit=1)
+            if similar:
+                distance = similar[0].get("vec_distance", 999)
+                # sqlite-vec returns L2 distance; cosine similarity ≈ 1 - distance/2 for normalized vectors
+                # For nomic-embed-text (normalized), distance < 0.4 ≈ cosine > 0.92
+                if distance < 0.4:
+                    return {
+                        "id": similar[0]["id"],
+                        "status": "similar",
+                        "reason": "semantic_cold",
+                        "distance": round(distance, 4),
+                    }
+
         result = self.storage.hot_add(target, content)
+
+        # ── Auto-eviction: archive oldest entries when over capacity ──
+        limit = self.HOT_MEMORY_LIMIT if target == "memory" else self.HOT_USER_LIMIT
+        current_chars = self.storage.hot_chars(target)
+        if current_chars > limit:
+            self._evict_hot(target, current_chars, limit)
+
         return result
+
+    def _evict_hot(self, target: str, current_chars: int, limit: int) -> None:
+        """Archive oldest hot entries until under capacity (with 10% headroom)."""
+        target_chars = int(limit * 0.9)  # evict to 90% to avoid thrashing
+        entries = self.storage.hot_list(target)  # sorted by sort_order, created_at
+        evicted = 0
+        for entry in entries:  # oldest first
+            if current_chars <= target_chars:
+                break
+            entry_len = len(entry["content"])
+            # Archive to cold storage
+            try:
+                removed = self.storage.hot_remove(target, entry["content"][:60])
+                if "error" not in removed:
+                    cold_result = self.storage.cold_add(
+                        target=target,
+                        content=removed["content"],
+                        source="evicted",
+                        archived_from=removed["id"],
+                    )
+                    self._embed_cold_entry(cold_result["id"])
+                    self.storage._log("evict", removed["id"], {"cold_id": cold_result["id"]})
+                    current_chars -= entry_len
+                    evicted += 1
+            except Exception as e:
+                logger.warning("Eviction failed for entry %s: %s", entry["id"], e)
+                break
+        if evicted:
+            logger.info("Evicted %d entries from hot/%s, chars: %d→%d (limit=%d)",
+                       evicted, target, current_chars + sum(len(e["content"]) for e in entries[:evicted]), current_chars, limit)
 
     # ── F2: Memory Search (hybrid: FTS5 + vector + RRF) ──
 
@@ -190,9 +281,21 @@ class HippoEngine:
         """Search cold memory only."""
         return self.storage.cold_search(query, target, limit)
 
+    def cold_get(self, memory_id: str) -> dict | None:
+        """Get a single cold memory by ID."""
+        return self.storage.cold_get(memory_id)
+
+    def cold_update(self, memory_id: str, content: str) -> dict:
+        """Update a cold memory's content and refresh embedding."""
+        return self.storage.cold_update(memory_id, content)
+
     def cold_delete(self, memory_id: str) -> dict:
         """Permanently delete a cold memory."""
         return self.storage.cold_delete(memory_id)
+
+    def cold_timeline(self, target: str | None = None, limit: int = 50, offset: int = 0) -> list[dict]:
+        """Browse cold memories by time (newest first)."""
+        return self.storage.cold_timeline(target, limit, offset)
 
     # ── Hot memory bulk read (for injection) ──
 
