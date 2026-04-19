@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  openhippo:
+    build: .
+    container_name: openhippo
+    restart: unless-stopped
+    ports:
+      - "8200:8200"
+    volumes:
+      - hippo_data:/data
+    environment:
+      - HIPPO_AUTH_TOKEN=${HIPPO_AUTH_TOKEN:-}
+      - HIPPO_EMBEDDING_PROVIDER=local
+      - HIPPO_LOG_LEVEL=INFO
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8200/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  hippo_data:

@@ -124,6 +124,12 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
     else:
         logger.debug("No config file at %s, using defaults", path)
 
+    # Single-token shortcut: HIPPO_AUTH_TOKEN="my-secret" enables auth automatically
+    single_token = os.environ.get("HIPPO_AUTH_TOKEN")
+    if single_token:
+        _set_nested(config, "auth.enabled", "true")
+        config["auth"]["tokens"] = [{"name": "env-token", "token": single_token, "scopes": ["*"]}]
+
     # Apply environment variable overrides
     for env_var, dotpath in ENV_MAP.items():
         value = os.environ.get(env_var)

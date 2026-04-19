@@ -10,7 +10,18 @@ from ..core.engine import HippoEngine
 app = FastAPI(
     title="OpenHippo",
     description="🦛 Local-first memory engine for AI Agents",
-    version="0.1.0",
+    version="0.2.0",
+)
+
+# Auth middleware (loaded from config)
+from ..core.config import get_config, get as cfg_get
+from .auth import BearerAuthMiddleware
+
+_conf = get_config()
+app.add_middleware(
+    BearerAuthMiddleware,
+    enabled=cfg_get(_conf, "auth.enabled", False),
+    tokens=cfg_get(_conf, "auth.tokens", []),
 )
 
 # Global engine instance (initialized on startup)
