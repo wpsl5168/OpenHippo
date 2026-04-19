@@ -16,3 +16,6 @@ htmlcov/
 .env
 .env.local
 .DS_Store
+docs/PRD.md
+docs/PROGRESS.md
+config.yaml
