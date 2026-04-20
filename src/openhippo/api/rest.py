@@ -7,8 +7,11 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from ..core.engine import HippoEngine
@@ -508,3 +511,15 @@ def dream_metrics():
     persistent = eng.metrics()
     runtime = dict(_dream_runtime)
     return {"data": {"persistent": persistent, "scheduler": runtime}}
+
+
+# ── F20 Audit Web UI (single-page, Alpine.js + Tailwind CDN) ──
+
+_UI_DIR = Path(__file__).resolve().parent.parent / "ui"
+if _UI_DIR.exists() and (_UI_DIR / "index.html").exists():
+    app.mount("/ui", StaticFiles(directory=str(_UI_DIR), html=True), name="ui")
+
+    @app.get("/", include_in_schema=False)
+    def _root_redirect():
+        """Redirect root to the audit UI for convenience."""
+        return RedirectResponse(url="/ui/")

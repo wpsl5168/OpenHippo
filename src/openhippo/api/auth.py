@@ -14,7 +14,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 logger = logging.getLogger(__name__)
 
 # Paths that bypass auth
-PUBLIC_PATHS = {"/health", "/docs", "/openapi.json", "/redoc"}
+PUBLIC_PATHS = {"/health", "/docs", "/openapi.json", "/redoc", "/"}
+PUBLIC_PREFIXES = ("/ui",)
 
 
 def _hash_token(token: str) -> str:
@@ -51,6 +52,8 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
         # Skip public paths
         if request.url.path in PUBLIC_PATHS:
+            return await call_next(request)
+        if request.url.path.startswith(PUBLIC_PREFIXES):
             return await call_next(request)
 
         # Extract token
