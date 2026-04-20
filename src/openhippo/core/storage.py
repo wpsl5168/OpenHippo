@@ -276,19 +276,28 @@ class Storage:
         return dict(row) if row else None
 
     def cold_search(self, query: str, target: str | None = None, limit: int = 20,
-                    include_consolidated: bool = False) -> list[dict]:
+                    include_consolidated: bool = False,
+                    include_dormant: bool = False) -> list[dict]:
         """Search cold memory with FTS5 fallback to LIKE.
 
         By default, rows merged into a seed by Dream (dream_status='consolidated')
-        are hidden — only the seed surfaces. Pass include_consolidated=True for
-        full audit views.
+        AND rows soft-forgotten (dream_status='dormant') are hidden — only
+        active memories surface. Pass the corresponding flag(s) for audit views.
         """
         conn = self._get_conn()
-        # Build the dream-status filter as a SQL fragment we can append to either branch.
-        status_clause = "" if include_consolidated else \
-            " AND COALESCE(cm.dream_status, 'active') != 'consolidated'"
-        like_status_clause = "" if include_consolidated else \
-            " AND COALESCE(dream_status, 'active') != 'consolidated'"
+        # Build dream-status filter as SQL fragment we can append to either branch.
+        excluded = []
+        if not include_consolidated:
+            excluded.append("'consolidated'")
+        if not include_dormant:
+            excluded.append("'dormant'")
+        if excluded:
+            in_clause = "(" + ",".join(excluded) + ")"
+            status_clause = f" AND COALESCE(cm.dream_status, 'active') NOT IN {in_clause}"
+            like_status_clause = f" AND COALESCE(dream_status, 'active') NOT IN {in_clause}"
+        else:
+            status_clause = ""
+            like_status_clause = ""
         try:
             if target:
                 rows = conn.execute(

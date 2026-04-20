@@ -43,6 +43,8 @@ class DreamConfig:
     knn_fetch: int = DEFAULT_KNN_FETCH
     target: str | None = None   # restrict to one target ('memory' / 'user' / None=all)
     enable_forget: bool = False  # PR-3 — off by default per老王 decision
+    forget_threshold: float = 1.0
+    forget_min_age_days: int = 7
 
     def to_dict(self) -> dict:
         return {
@@ -52,8 +54,17 @@ class DreamConfig:
             "knn_fetch": self.knn_fetch,
             "target": self.target,
             "enable_forget": self.enable_forget,
-            "version": "f5-pr2",
+            "forget_threshold": self.forget_threshold,
+            "forget_min_age_days": self.forget_min_age_days,
+            "version": "f5-pr3",
         }
+
+
+# ── Forget tuning (PR-3) ──
+# decay_score = age_days / 30 - access_count * 0.5 - importance * 2
+# Higher score = more forgettable. Threshold above which a row goes dormant.
+DEFAULT_FORGET_THRESHOLD = 1.0   # conservative: ~30 days untouched + low importance
+DEFAULT_FORGET_MIN_AGE_DAYS = 7  # never forget anything younger than a week
 
 
 @dataclass
@@ -324,6 +335,7 @@ class DreamEngine:
 
         consolidated_count = 0
         seeds_updated = 0
+        forgotten_count = 0
         candidates: list[dict] = []
         clusters: list[Cluster] = []
 
@@ -344,18 +356,26 @@ class DreamEngine:
                     )
                     # don't break the run
 
+            # Stage 4 — only when explicitly enabled
+            if cfg.enable_forget:
+                try:
+                    forgotten_count = self._apply_forget(run_id, cfg)
+                except Exception as forget_err:
+                    logger.exception("dream forget stage failed: %s", forget_err)
+
             duration_ms = int((time.time() - started) * 1000)
             conn.execute(
                 """UPDATE dream_runs
                    SET finished_at = ?, status = 'completed',
                        candidates_count = ?, clusters_count = ?,
-                       consolidated_count = ?, forgotten_count = 0
+                       consolidated_count = ?, forgotten_count = ?
                    WHERE id = ?""",
                 (
                     _iso(time.time()),
                     len(candidates),
                     len(clusters),
                     consolidated_count,
+                    forgotten_count,
                     run_id,
                 ),
             )
@@ -367,7 +387,7 @@ class DreamEngine:
                 clusters_count=len(clusters),
                 consolidated_count=consolidated_count,
                 seeds_updated=seeds_updated,
-                forgotten_count=0,
+                forgotten_count=forgotten_count,
                 duration_ms=duration_ms,
                 started_at=started,
                 config=cfg.to_dict(),
@@ -496,6 +516,136 @@ class DreamEngine:
         )
         conn.commit()
         return len(member_ids)
+
+    # ── Stage 4: Forget (soft decay) ──
+    def _apply_forget(self, run_id: str, cfg: DreamConfig) -> int:
+        """Mark stale, low-importance, rarely-accessed rows as 'dormant'.
+
+        decay_score = age_days/30 - access_count*0.5 - importance*2
+        Above forget_threshold → dormant. Reversible: restore() flips it back.
+
+        Honored guards:
+        - Only `dream_status='active'` rows (don't re-forget consolidated)
+        - Skip rows younger than forget_min_age_days (default 7d)
+        - cfg.target filter respected
+        """
+        conn = self.storage._get_conn()
+        now = time.time()
+        min_age_seconds = cfg.forget_min_age_days * 86400.0
+
+        sql = """
+            SELECT id, content, target, created_at, importance, access_count
+            FROM cold_memory
+            WHERE COALESCE(dream_status, 'active') = 'active'
+              AND consolidated_into IS NULL
+              AND created_at IS NOT NULL
+              AND (? - created_at) >= ?
+        """
+        params: list = [now, min_age_seconds]
+        if cfg.target:
+            sql += " AND target = ?"
+            params.append(cfg.target)
+
+        rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+        forgotten = 0
+        now_iso = _iso(now)
+
+        for r in rows:
+            age_days = max(0.0, (now - float(r["created_at"])) / 86400.0)
+            access = int(r.get("access_count") or 0)
+            importance = float(r.get("importance") or 0.5)
+            decay = age_days / 30.0 - access * 0.5 - importance * 2.0
+            if decay <= cfg.forget_threshold:
+                continue
+
+            conn.execute(
+                """UPDATE cold_memory
+                   SET dream_status = 'dormant', last_dream_at = ?
+                   WHERE id = ? AND COALESCE(dream_status, 'active') = 'active'""",
+                (now_iso, r["id"]),
+            )
+            conn.execute(
+                """INSERT INTO dream_actions
+                   (dream_run_id, action, memory_id, details, created_at)
+                   VALUES (?, 'forget', ?, ?, ?)""",
+                (
+                    run_id, r["id"],
+                    json.dumps({
+                        "decay_score": round(decay, 4),
+                        "age_days": round(age_days, 2),
+                        "access_count": access,
+                        "importance": importance,
+                        "threshold": cfg.forget_threshold,
+                    }),
+                    now_iso,
+                ),
+            )
+            forgotten += 1
+
+        conn.commit()
+        return forgotten
+
+    # ── Restore (reversal of forget / consolidate) ──
+    def restore(self, memory_id: str) -> dict:
+        """Flip a 'dormant' or 'consolidated' row back to 'active'.
+
+        For consolidated rows: also strips consolidated_into, but does NOT
+        attempt to undo the seed's accumulated importance/access_count/merged_from
+        — that would require time-travel of the audit chain. The seed continues
+        to exist independently; restoring a member just makes both visible.
+        """
+        conn = self.storage._get_conn()
+        row = conn.execute(
+            "SELECT id, dream_status, consolidated_into FROM cold_memory WHERE id = ?",
+            (memory_id,),
+        ).fetchone()
+        if not row:
+            return {"error": f"Memory {memory_id} not found"}
+
+        prev_status = row["dream_status"] or "active"
+        prev_seed = row["consolidated_into"]
+        if prev_status == "active" and not prev_seed:
+            return {"id": memory_id, "status": "noop", "message": "already active"}
+
+        now_iso = _iso(time.time())
+        conn.execute(
+            """UPDATE cold_memory
+               SET dream_status = 'active',
+                   consolidated_into = NULL,
+                   last_dream_at = ?
+               WHERE id = ?""",
+            (now_iso, memory_id),
+        )
+        # Audit row (no run_id since this is a manual op — use a synthetic run)
+        # Open a one-shot 'restore' run for FK integrity & history visibility.
+        run_id = str(uuid.uuid4())
+        conn.execute(
+            """INSERT INTO dream_runs
+               (id, started_at, finished_at, status, config_snapshot,
+                candidates_count, clusters_count, consolidated_count, forgotten_count)
+               VALUES (?, ?, ?, 'restored', '{"manual":true}', 0, 0, 0, 0)""",
+            (run_id, now_iso, now_iso),
+        )
+        conn.execute(
+            """INSERT INTO dream_actions
+               (dream_run_id, action, memory_id, details, created_at)
+               VALUES (?, 'restore', ?, ?, ?)""",
+            (
+                run_id, memory_id,
+                json.dumps({
+                    "prev_status": prev_status,
+                    "prev_consolidated_into": prev_seed,
+                }),
+                now_iso,
+            ),
+        )
+        conn.commit()
+        return {
+            "id": memory_id,
+            "status": "restored",
+            "from": prev_status,
+            "run_id": run_id,
+        }
 
     # ── Run history ──
     def list_runs(self, limit: int = 20) -> list[dict]:

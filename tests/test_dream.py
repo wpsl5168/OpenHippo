@@ -125,7 +125,7 @@ class TestPreviewSideEffectFree:
         snap = json.loads(runs[0]["config_snapshot"])
         assert snap["l2_threshold"] == 0.42
         assert snap["min_cluster_size"] == 3
-        assert snap["version"] == "f5-pr2"
+        assert snap["version"] == "f5-pr3"
 
 
 # ── List runs ──

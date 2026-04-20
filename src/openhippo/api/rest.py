@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
@@ -15,17 +18,65 @@ from ..core.config import get_config, get as cfg_get
 from .auth import BearerAuthMiddleware
 
 
+logger = logging.getLogger(__name__)
+
 # Global engine instance (initialized in lifespan)
 engine: HippoEngine | None = None
+_dream_task: asyncio.Task | None = None
+
+
+async def _dream_autoloop(interval_seconds: float) -> None:
+    """Background task: run consolidate() every `interval_seconds`.
+
+    Mirrors老王's vision: "记忆 Agent 全自动无感知运行 (像人脑记忆)".
+    Runs forget OFF by default — that's a manual decision per env config.
+    Crashes are logged and the loop continues (we never want to silently die).
+    """
+    from ..core.dream import DreamConfig, DreamEngine
+    # Initial delay so we don't slam the engine right at boot
+    await asyncio.sleep(min(60.0, interval_seconds))
+    while True:
+        try:
+            if engine is not None:
+                eng = DreamEngine(engine.storage)
+                cfg = DreamConfig(enable_forget=False)
+                # Run sync consolidate() in a worker thread so we don't block the loop
+                result = await asyncio.to_thread(eng.consolidate, cfg)
+                logger.info(
+                    "auto-dream completed: run=%s candidates=%d clusters=%d "
+                    "consolidated=%d duration_ms=%d",
+                    result.run_id, result.candidates_count, result.clusters_count,
+                    result.consolidated_count, result.duration_ms,
+                )
+        except Exception:
+            logger.exception("auto-dream loop iteration failed; will retry next cycle")
+        try:
+            await asyncio.sleep(interval_seconds)
+        except asyncio.CancelledError:
+            raise
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global engine
+    global engine, _dream_task
     engine = HippoEngine()
+
+    # Start background dream loop unless explicitly disabled.
+    # Knob: env OPENHIPPO_DREAM_AUTO=0 disables; OPENHIPPO_DREAM_INTERVAL_HOURS overrides default.
+    auto_enabled = os.environ.get("OPENHIPPO_DREAM_AUTO", "1").lower() not in {"0", "false", "no"}
+    interval_hours = float(os.environ.get("OPENHIPPO_DREAM_INTERVAL_HOURS", "24"))
+    if auto_enabled and interval_hours > 0:
+        _dream_task = asyncio.create_task(_dream_autoloop(interval_hours * 3600.0))
+        logger.info("auto-dream scheduler started (every %sh)", interval_hours)
     try:
         yield
     finally:
+        if _dream_task is not None:
+            _dream_task.cancel()
+            try:
+                await _dream_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if engine:
             engine.close()
 
@@ -336,6 +387,9 @@ class DreamRunRequest(BaseModel):
     min_cluster_size: int = Field(2, ge=2, le=20)
     max_candidates: int = Field(500, ge=1, le=5000)
     knn_fetch: int = Field(20, ge=2, le=100)
+    enable_forget: bool = Field(False, description="Enable Stage 4 soft decay (default off)")
+    forget_threshold: float = Field(1.0, ge=0.0, le=10.0)
+    forget_min_age_days: int = Field(7, ge=0, le=365)
 
 
 @app.post("/v1/dream/run")
@@ -344,10 +398,13 @@ def dream_run(req: DreamRunRequest):
 
     This MUTATES data: cluster members get dream_status='consolidated' and
     consolidated_into=<seed_id>. Originals are preserved (not deleted) so a
-    future restore endpoint can roll back. Forget stage is OFF in PR-2.
+    future restore endpoint can roll back.
+
+    Forget stage (Stage 4) is OFF by default per老王's policy. Opt in with
+    enable_forget=true to also soft-mark stale low-value rows as 'dormant'.
 
     PRD: "记忆 Agent 全自动无感知运行"; this is the manual trigger.
-    Auto-scheduling lands in PR-3.
+    Auto-scheduling runs every 24h in lifespan (PR-3).
     """
     from ..core.dream import DreamConfig, DreamEngine
     cfg = DreamConfig(
@@ -356,10 +413,27 @@ def dream_run(req: DreamRunRequest):
         min_cluster_size=req.min_cluster_size,
         max_candidates=req.max_candidates,
         knn_fetch=req.knn_fetch,
-        enable_forget=False,  # PR-3
+        enable_forget=req.enable_forget,
+        forget_threshold=req.forget_threshold,
+        forget_min_age_days=req.forget_min_age_days,
     )
     eng = DreamEngine(_engine().storage)
     return {"data": eng.consolidate(cfg).to_dict()}
+
+
+@app.post("/v1/dream/restore/{memory_id}")
+def dream_restore(memory_id: str):
+    """Reverse a forget/consolidate action — flip the row back to 'active'.
+
+    For consolidated members this strips consolidated_into; the seed remains
+    independently visible (we don't time-travel its accumulated importance).
+    """
+    from ..core.dream import DreamEngine
+    eng = DreamEngine(_engine().storage)
+    result = eng.restore(memory_id)
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return {"data": result}
 
 
 @app.get("/v1/dream/runs/{run_id}")
