@@ -386,6 +386,88 @@ class Storage:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def unified_timeline(self, target: str | None = None,
+                         agent_id: str | None = None,
+                         limit: int = 50, offset: int = 0) -> list[dict]:
+        """Combined hot+cold timeline ordered by created_at DESC.
+        End-user facing — does not distinguish tiers.
+        agent_id='__local__' filters to hot + cold rows where agent_id IS NULL.
+        """
+        conn = self._get_conn()
+        params: list = []
+        where_hot = ["1=1"]
+        where_cold = ["1=1"]
+        if target:
+            where_hot.append("target = ?")
+            where_cold.append("target = ?")
+        # agent filter
+        if agent_id == "__local__":
+            where_cold.append("agent_id IS NULL")
+        elif agent_id:
+            where_cold.append("agent_id = ?")
+            # hot has no agent_id, exclude when filtering by specific agent
+            where_hot.append("0=1")
+
+        # Build params in execution order (hot params, cold params, limit, offset)
+        hot_params: list = []
+        cold_params: list = []
+        if target:
+            hot_params.append(target)
+            cold_params.append(target)
+        if agent_id and agent_id != "__local__":
+            cold_params.append(agent_id)
+
+        sql = f"""
+            SELECT id, target, content, created_at, updated_at,
+                   NULL as source, NULL as agent_id, NULL as scope, NULL as session_id, 'hot' as tier
+            FROM hot_memory WHERE {' AND '.join(where_hot)}
+            UNION ALL
+            SELECT id, target, content, created_at, updated_at,
+                   source, agent_id, scope, session_id, 'cold' as tier
+            FROM cold_memory WHERE {' AND '.join(where_cold)}
+            ORDER BY created_at DESC LIMIT ? OFFSET ?
+        """
+        rows = conn.execute(sql, (*hot_params, *cold_params, limit, offset)).fetchall()
+        return [dict(r) for r in rows]
+
+    def unified_count(self, target: str | None = None,
+                      agent_id: str | None = None) -> int:
+        """Total memories matching filters (hot+cold combined)."""
+        conn = self._get_conn()
+        hot_n = 0
+        cold_n = 0
+        if agent_id and agent_id != "__local__":
+            # Specific agent only matches cold rows
+            if target:
+                cold_n = conn.execute(
+                    "SELECT COUNT(*) FROM cold_memory WHERE agent_id=? AND target=?",
+                    (agent_id, target)).fetchone()[0]
+            else:
+                cold_n = conn.execute(
+                    "SELECT COUNT(*) FROM cold_memory WHERE agent_id=?",
+                    (agent_id,)).fetchone()[0]
+        elif agent_id == "__local__":
+            if target:
+                hot_n = conn.execute(
+                    "SELECT COUNT(*) FROM hot_memory WHERE target=?", (target,)).fetchone()[0]
+                cold_n = conn.execute(
+                    "SELECT COUNT(*) FROM cold_memory WHERE agent_id IS NULL AND target=?",
+                    (target,)).fetchone()[0]
+            else:
+                hot_n = conn.execute("SELECT COUNT(*) FROM hot_memory").fetchone()[0]
+                cold_n = conn.execute(
+                    "SELECT COUNT(*) FROM cold_memory WHERE agent_id IS NULL").fetchone()[0]
+        else:
+            if target:
+                hot_n = conn.execute(
+                    "SELECT COUNT(*) FROM hot_memory WHERE target=?", (target,)).fetchone()[0]
+                cold_n = conn.execute(
+                    "SELECT COUNT(*) FROM cold_memory WHERE target=?", (target,)).fetchone()[0]
+            else:
+                hot_n = conn.execute("SELECT COUNT(*) FROM hot_memory").fetchone()[0]
+                cold_n = conn.execute("SELECT COUNT(*) FROM cold_memory").fetchone()[0]
+        return hot_n + cold_n
+
     def cold_count(self, target: str | None = None) -> int:
         conn = self._get_conn()
         if target:
@@ -505,6 +587,87 @@ class Storage:
             "cold_user_count": self.cold_count("user"),
             "vec_count": self.vec_count(),
             "db_size_kb": self.db_path.stat().st_size // 1024 if self.db_path.exists() else 0,
+        }
+
+    def overview(self) -> dict:
+        """User-facing aggregate stats. Combines hot+cold (no tier distinction)
+        for end users who don't care about internal tiering.
+
+        Returns:
+            total: combined hot+cold memory count
+            earliest_at / latest_at: epoch seconds across all memories
+            by_target: [{key, label, count}] grouped by target (memory/user)
+            by_agent: [{key, label, count}] grouped by agent_id (cold only;
+                      hot has no agent_id concept)
+            daily_counts_30d: [{date: YYYY-MM-DD, count}] for last 30 days,
+                              zero-filled, based on created_at of all memories
+        """
+        import datetime as _dt
+        conn = self._get_conn()
+        # totals
+        hot_rows = conn.execute(
+            "SELECT target, COUNT(*) c, MIN(created_at) mn, MAX(created_at) mx "
+            "FROM hot_memory GROUP BY target"
+        ).fetchall()
+        cold_rows = conn.execute(
+            "SELECT target, COUNT(*) c, MIN(created_at) mn, MAX(created_at) mx "
+            "FROM cold_memory GROUP BY target"
+        ).fetchall()
+
+        by_target_map: dict[str, int] = {}
+        mins: list[float] = []
+        maxs: list[float] = []
+        for r in list(hot_rows) + list(cold_rows):
+            by_target_map[r["target"]] = by_target_map.get(r["target"], 0) + r["c"]
+            if r["mn"] is not None: mins.append(r["mn"])
+            if r["mx"] is not None: maxs.append(r["mx"])
+
+        target_labels = {"memory": "工作笔记", "user": "关于你"}
+        by_target = [
+            {"key": k, "label": target_labels.get(k, k), "count": v}
+            for k, v in sorted(by_target_map.items(), key=lambda x: -x[1])
+        ]
+
+        # by agent (cold only — hot has no agent_id)
+        agent_rows = conn.execute(
+            "SELECT COALESCE(agent_id, '__local__') as a, COUNT(*) c "
+            "FROM cold_memory GROUP BY a ORDER BY c DESC"
+        ).fetchall()
+        # Add hot rows under '__local__' bucket
+        hot_total = sum(r["c"] for r in hot_rows)
+        agent_map: dict[str, int] = {r["a"]: r["c"] for r in agent_rows}
+        if hot_total:
+            agent_map["__local__"] = agent_map.get("__local__", 0) + hot_total
+        by_agent = [
+            {"key": k, "label": "本地" if k == "__local__" else k, "count": v}
+            for k, v in sorted(agent_map.items(), key=lambda x: -x[1])
+        ]
+
+        # daily counts last 30 days (zero-filled)
+        today = _dt.datetime.now().date()
+        start = today - _dt.timedelta(days=29)
+        start_epoch = _dt.datetime.combine(start, _dt.time.min).timestamp()
+        day_rows = conn.execute(
+            "SELECT date(created_at, 'unixepoch', 'localtime') d, COUNT(*) c "
+            "FROM (SELECT created_at FROM hot_memory UNION ALL "
+            "      SELECT created_at FROM cold_memory) "
+            "WHERE created_at >= ? GROUP BY d",
+            (start_epoch,),
+        ).fetchall()
+        day_map = {r["d"]: r["c"] for r in day_rows}
+        daily = []
+        for i in range(30):
+            d = start + _dt.timedelta(days=i)
+            ds = d.isoformat()
+            daily.append({"date": ds, "count": day_map.get(ds, 0)})
+
+        return {
+            "total": sum(by_target_map.values()),
+            "earliest_at": min(mins) if mins else None,
+            "latest_at": max(maxs) if maxs else None,
+            "by_target": by_target,
+            "by_agent": by_agent,
+            "daily_counts_30d": daily,
         }
 
     # ── Logging ──

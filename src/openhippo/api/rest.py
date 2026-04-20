@@ -222,6 +222,36 @@ def get_hot(target: str | None = None):
 def get_stats():
     return {"data": _engine().stats()}
 
+
+@app.get("/v1/overview")
+def get_overview():
+    """End-user facing aggregate dashboard: totals, 30d activity,
+    target/agent distribution. Combines hot+cold (no tier distinction)."""
+    return {"data": _engine().overview()}
+
+
+@app.get("/v1/memories/all")
+def memories_all(
+    target: str | None = None,
+    agent_id: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    """Unified timeline (hot+cold combined) for end-user UI.
+    Supports pagination via limit+offset and filtering by target/agent_id.
+    Returns {items, total, has_more} envelope for infinite-scroll UIs.
+    """
+    e = _engine()
+    items = e.unified_timeline(target, agent_id, limit, offset)
+    total = e.unified_count(target, agent_id)
+    return {"data": {
+        "items": items,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + len(items) < total,
+    }}
+
 @app.get("/v1/logs")
 def get_logs(limit: int = 50):
     return {"data": _engine().get_logs(limit)}

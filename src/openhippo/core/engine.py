@@ -372,6 +372,20 @@ class HippoEngine:
         s["hot_user_usage"] = f"{s['hot_user_chars']}/{self.HOT_USER_LIMIT}"
         return s
 
+    def overview(self) -> dict:
+        """End-user facing aggregate dashboard data."""
+        return self.storage.overview()
+
+    def unified_timeline(self, target: str | None = None,
+                         agent_id: str | None = None,
+                         limit: int = 50, offset: int = 0) -> list[dict]:
+        """Combined hot+cold timeline for end-user UI."""
+        return self.storage.unified_timeline(target, agent_id, limit, offset)
+
+    def unified_count(self, target: str | None = None,
+                      agent_id: str | None = None) -> int:
+        return self.storage.unified_count(target, agent_id)
+
     # ── Logs ──
 
     def get_logs(self, limit: int = 50) -> list[dict]:
