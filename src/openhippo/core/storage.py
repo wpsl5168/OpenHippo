@@ -388,13 +388,15 @@ class Storage:
 
     def unified_timeline(self, target: str | None = None,
                          agent_id: str | None = None,
-                         limit: int = 50, offset: int = 0) -> list[dict]:
+                         limit: int = 50, offset: int = 0,
+                         date_from: float | None = None,
+                         date_to: float | None = None) -> list[dict]:
         """Combined hot+cold timeline ordered by created_at DESC.
         End-user facing — does not distinguish tiers.
         agent_id='__local__' filters to hot + cold rows where agent_id IS NULL.
+        date_from/date_to are unix timestamps (inclusive lower, exclusive upper).
         """
         conn = self._get_conn()
-        params: list = []
         where_hot = ["1=1"]
         where_cold = ["1=1"]
         if target:
@@ -407,6 +409,12 @@ class Storage:
             where_cold.append("agent_id = ?")
             # hot has no agent_id, exclude when filtering by specific agent
             where_hot.append("0=1")
+        if date_from is not None:
+            where_hot.append("created_at >= ?")
+            where_cold.append("created_at >= ?")
+        if date_to is not None:
+            where_hot.append("created_at < ?")
+            where_cold.append("created_at < ?")
 
         # Build params in execution order (hot params, cold params, limit, offset)
         hot_params: list = []
@@ -416,6 +424,12 @@ class Storage:
             cold_params.append(target)
         if agent_id and agent_id != "__local__":
             cold_params.append(agent_id)
+        if date_from is not None:
+            hot_params.append(date_from)
+            cold_params.append(date_from)
+        if date_to is not None:
+            hot_params.append(date_to)
+            cold_params.append(date_to)
 
         sql = f"""
             SELECT id, target, content, created_at, updated_at,
@@ -431,42 +445,85 @@ class Storage:
         return [dict(r) for r in rows]
 
     def unified_count(self, target: str | None = None,
-                      agent_id: str | None = None) -> int:
+                      agent_id: str | None = None,
+                      date_from: float | None = None,
+                      date_to: float | None = None) -> int:
         """Total memories matching filters (hot+cold combined)."""
         conn = self._get_conn()
-        hot_n = 0
-        cold_n = 0
-        if agent_id and agent_id != "__local__":
-            # Specific agent only matches cold rows
+
+        def _build(table: str, is_cold: bool) -> tuple[str, list]:
+            where = ["1=1"]
+            params: list = []
             if target:
-                cold_n = conn.execute(
-                    "SELECT COUNT(*) FROM cold_memory WHERE agent_id=? AND target=?",
-                    (agent_id, target)).fetchone()[0]
+                where.append("target = ?"); params.append(target)
+            if is_cold:
+                if agent_id == "__local__":
+                    where.append("agent_id IS NULL")
+                elif agent_id:
+                    where.append("agent_id = ?"); params.append(agent_id)
             else:
-                cold_n = conn.execute(
-                    "SELECT COUNT(*) FROM cold_memory WHERE agent_id=?",
-                    (agent_id,)).fetchone()[0]
-        elif agent_id == "__local__":
+                # hot has no agent_id; only matches when not filtering by specific agent
+                if agent_id and agent_id != "__local__":
+                    return "", []
+            if date_from is not None:
+                where.append("created_at >= ?"); params.append(date_from)
+            if date_to is not None:
+                where.append("created_at < ?"); params.append(date_to)
+            return f"SELECT COUNT(*) FROM {table} WHERE {' AND '.join(where)}", params
+
+        total = 0
+        for table, is_cold in [("hot_memory", False), ("cold_memory", True)]:
+            sql, params = _build(table, is_cold)
+            if not sql:
+                continue
+            total += conn.execute(sql, params).fetchone()[0]
+        return total
+
+    def daily_calendar(self, target: str | None = None,
+                       agent_id: str | None = None,
+                       days: int = 365) -> list[dict]:
+        """Per-day memory counts over the past N days (UTC dates).
+        Returns [{date: 'YYYY-MM-DD', count: N}] sorted oldest→newest,
+        with zero-count days included so the UI can render a continuous strip.
+        """
+        import datetime as _dt
+        conn = self._get_conn()
+        now = _dt.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        start = now - _dt.timedelta(days=days - 1)
+        start_ts = start.timestamp()
+
+        def _build(table: str, is_cold: bool) -> tuple[str, list]:
+            where = ["created_at >= ?"]
+            params: list = [start_ts]
             if target:
-                hot_n = conn.execute(
-                    "SELECT COUNT(*) FROM hot_memory WHERE target=?", (target,)).fetchone()[0]
-                cold_n = conn.execute(
-                    "SELECT COUNT(*) FROM cold_memory WHERE agent_id IS NULL AND target=?",
-                    (target,)).fetchone()[0]
+                where.append("target = ?"); params.append(target)
+            if is_cold:
+                if agent_id == "__local__":
+                    where.append("agent_id IS NULL")
+                elif agent_id:
+                    where.append("agent_id = ?"); params.append(agent_id)
             else:
-                hot_n = conn.execute("SELECT COUNT(*) FROM hot_memory").fetchone()[0]
-                cold_n = conn.execute(
-                    "SELECT COUNT(*) FROM cold_memory WHERE agent_id IS NULL").fetchone()[0]
-        else:
-            if target:
-                hot_n = conn.execute(
-                    "SELECT COUNT(*) FROM hot_memory WHERE target=?", (target,)).fetchone()[0]
-                cold_n = conn.execute(
-                    "SELECT COUNT(*) FROM cold_memory WHERE target=?", (target,)).fetchone()[0]
-            else:
-                hot_n = conn.execute("SELECT COUNT(*) FROM hot_memory").fetchone()[0]
-                cold_n = conn.execute("SELECT COUNT(*) FROM cold_memory").fetchone()[0]
-        return hot_n + cold_n
+                if agent_id and agent_id != "__local__":
+                    return "", []
+            return (
+                f"SELECT created_at FROM {table} WHERE {' AND '.join(where)}",
+                params,
+            )
+
+        bucket: dict[str, int] = {}
+        for table, is_cold in [("hot_memory", False), ("cold_memory", True)]:
+            sql, params = _build(table, is_cold)
+            if not sql:
+                continue
+            for (ts,) in conn.execute(sql, params).fetchall():
+                d = _dt.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+                bucket[d] = bucket.get(d, 0) + 1
+
+        out = []
+        for i in range(days):
+            d = (start + _dt.timedelta(days=i)).strftime("%Y-%m-%d")
+            out.append({"date": d, "count": bucket.get(d, 0)})
+        return out
 
     def cold_count(self, target: str | None = None) -> int:
         conn = self._get_conn()

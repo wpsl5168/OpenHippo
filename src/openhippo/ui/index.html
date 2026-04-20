@@ -15,9 +15,9 @@
     theme: {
       extend: {
         colors: {
-          ink: { 900:'#1a1a1a', 700:'#4a4a4a', 500:'#78716c', 400:'#a8a29e' },
-          cream: { 50:'#fdfcf9', 100:'#faf8f2', 200:'#f0ece0' },
-          accent: { 50:'#f5f3ff', 100:'#ede9fe', 500:'#7c6eea', 600:'#6554d8', 700:'#5544bf' },
+          ink: { 900:'#1a1a1a', 700:'#4a4a4a', 500:'#78716c', 400:'#a8a29e', 300:'#c4beb6' },
+          cream: { 50:'#fdfcf9', 100:'#faf8f2', 200:'#f0ece0', 300:'#e2dcc8', 400:'#cfc7ad' },
+          accent: { 50:'#f5f3ff', 100:'#ede9fe', 200:'#ddd6fe', 300:'#c4b5fd', 500:'#7c6eea', 600:'#6554d8', 700:'#5544bf', 800:'#4435a0' },
         },
         fontFamily: {
           sans: ['-apple-system','BlinkMacSystemFont','"PingFang SC"','"Microsoft YaHei"','system-ui','sans-serif'],
@@ -48,6 +48,11 @@
   .spark-bar:hover { background-color: #5544bf !important; }
   .dot { width: 6px; height: 6px; border-radius: 999px; display: inline-block; }
   .day-divider { position: relative; }
+  .hippo-scrollbar::-webkit-scrollbar { height: 4px; }
+  .hippo-scrollbar::-webkit-scrollbar-track { background: transparent; }
+  .hippo-scrollbar::-webkit-scrollbar-thumb { background: #e7e2d0; border-radius: 2px; }
+  .hippo-scrollbar::-webkit-scrollbar-thumb:hover { background: #c9c2a8; }
+  .cal-bar:hover { transform: scaleY(1.08); transform-origin: bottom; }
   .day-divider::before { content: ''; position: absolute; left: 0; right: 0; top: 50%; height: 1px; background: #e7e2d0; z-index: 0; }
   .day-divider > span { position: relative; z-index: 1; background: #fdfcf9; padding: 0 14px; }
   .content-fade { position: relative; max-height: 9rem; overflow: hidden; }
@@ -297,11 +302,64 @@
 
 <!-- ═══════════ TIMELINE ═══════════ -->
 <section id="timeline-root">
-  <div class="flex items-center justify-between mb-5">
+  <div class="flex items-center justify-between mb-4">
     <h2 class="font-serif text-2xl text-ink-900">时间轴</h2>
     <div class="text-xs text-ink-500" x-show="timeline.length">
       已加载 <span class="text-ink-900 font-medium" x-text="timeline.length"></span>
       <span x-show="timelineTotal"> / <span x-text="timelineTotal"></span></span>
+    </div>
+  </div>
+
+  <!-- ─── Date scrubber ─── -->
+  <div class="bg-white rounded-2xl border border-cream-200 p-4 mb-6">
+    <div class="flex items-center gap-2 mb-3 flex-wrap">
+      <template x-for="p in datePresets" :key="p.key">
+        <button
+          @click="applyDatePreset(p.key)"
+          :class="datePreset === p.key ? 'bg-ink-900 text-white border-ink-900' : 'bg-white text-ink-700 border-cream-300 hover:border-ink-900'"
+          class="text-xs px-3 py-1.5 rounded-full border transition font-medium"
+          x-text="p.label"></button>
+      </template>
+      <div class="ml-auto flex items-center gap-3 text-xs text-ink-500">
+        <span x-show="dateRange.from || dateRange.to" class="font-mono text-ink-700"
+              x-text="rangeLabel"></span>
+        <button x-show="dateRange.from || dateRange.to"
+                @click="clearDateRange()"
+                class="text-accent-600 hover:underline">清除</button>
+        <span class="text-ink-400 hidden sm:inline">提示：点击单日 · Shift+点击选区间</span>
+      </div>
+    </div>
+    <!-- bar strip -->
+    <div class="relative">
+      <!-- max-count label -->
+      <div class="absolute -top-1 right-0 text-[10px] text-ink-400 font-mono pointer-events-none"
+           x-show="calMaxCount > 1" x-text="'峰值 ' + calMaxCount"></div>
+      <div class="overflow-x-auto pb-1 hippo-scrollbar" x-ref="calStrip">
+        <div class="flex items-end gap-[3px] h-24 min-w-full pt-3">
+          <template x-for="(d, i) in calendar" :key="d.date">
+            <button
+              type="button"
+              @click="onCalClick($event, d.date)"
+              :title="d.date + ' · ' + d.count + ' 条'"
+              :class="calBarClass(d)"
+              class="cal-bar relative flex-shrink-0 w-[10px] rounded-t-sm transition cursor-pointer border-b border-cream-200"
+              :style="'height: ' + calBarHeight(d) + '%'">
+            </button>
+          </template>
+        </div>
+      </div>
+      <!-- month ruler -->
+      <div class="overflow-x-auto hippo-scrollbar mt-1" x-ref="calRuler">
+        <div class="flex gap-[3px] min-w-full text-[10px] text-ink-500 font-mono border-t border-cream-200 pt-1">
+          <template x-for="(d, i) in calendar" :key="'r-'+d.date">
+            <div class="w-[10px] flex-shrink-0 text-center relative">
+              <span x-show="d.date.endsWith('-01')"
+                    class="absolute left-1/2 -translate-x-1/2 whitespace-nowrap font-medium text-ink-700"
+                    x-text="d.date.slice(0,4)+'/'+d.date.slice(5,7)"></span>
+            </div>
+          </template>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -395,6 +453,19 @@ function hippo() {
     expanded: {},
     filter: { agent_id: null, target: null },
 
+    // ──────── date scrubber ────────
+    calendar: [],            // [{date, count}] last N days
+    calendarDays: 90,
+    dateRange: { from: null, to: null },  // 'YYYY-MM-DD' inclusive bounds
+    datePreset: '30d',
+    datePresets: [
+      { key: 'today', label: '今天'   },
+      { key: '7d',    label: '近7天'  },
+      { key: '30d',   label: '近30天' },
+      { key: '90d',   label: '近90天' },
+      { key: 'all',   label: '全部'   },
+    ],
+
     // search
     query: '',
     suggestions: [],
@@ -451,7 +522,8 @@ function hippo() {
         }
       });
       await this.loadOverview();
-      await this.loadTimeline(true);
+      await this.loadCalendar();
+      this.applyDatePreset('30d');  // default view: last 30 days
       this.setupLazyLoad();
     },
 
@@ -472,6 +544,9 @@ function hippo() {
         const params = new URLSearchParams({ limit: this.limit, offset: this.timeline.length });
         if (this.filter.agent_id) params.set('agent_id', this.filter.agent_id);
         if (this.filter.target) params.set('target', this.filter.target);
+        const dr = this.computeDateBounds();
+        if (dr.from_ts !== null) params.set('date_from', dr.from_ts);
+        if (dr.to_ts !== null) params.set('date_to', dr.to_ts);
         const r = await fetch('/v1/memories/all?' + params.toString()).then(r => r.json());
         this.timeline.push(...r.data.items);
         this.timelineTotal = r.data.total;
@@ -604,7 +679,119 @@ function hippo() {
     // ──────── filters / scroll ────────
     async setAgentFilter(agentKey) {
       this.filter.agent_id = agentKey;
+      await this.loadCalendar();
       await this.loadTimeline(true);
+    },
+
+    // ──────── date scrubber ────────
+    async loadCalendar() {
+      try {
+        const params = new URLSearchParams({ days: this.calendarDays });
+        if (this.filter.agent_id) params.set('agent_id', this.filter.agent_id);
+        if (this.filter.target) params.set('target', this.filter.target);
+        const r = await fetch('/v1/calendar?' + params.toString()).then(r => r.json());
+        this.calendar = r.data || [];
+        this.$nextTick(() => {
+          // scroll the strip to the right (most recent)
+          const el = this.$refs.calStrip; if (el) el.scrollLeft = el.scrollWidth;
+          const ru = this.$refs.calRuler; if (ru) ru.scrollLeft = ru.scrollWidth;
+        });
+      } catch (e) { /* silent */ }
+    },
+    get calMaxCount() {
+      let m = 1;
+      for (const d of this.calendar) if (d.count > m) m = d.count;
+      return m;
+    },
+    calBarHeight(d) {
+      // log scale so a single peak doesn't flatten everything else
+      if (!d.count) return 8;  // baseline 8% so empty days are still clickable
+      const log = (n) => Math.log(n + 1);
+      return Math.max(18, Math.round(log(d.count) / log(this.calMaxCount) * 100));
+    },
+    calBarClass(d) {
+      const inRange = this.isDateInRange(d.date);
+      const hasData = d.count > 0;
+      // intensity ramp by relative count
+      const ratio = hasData ? d.count / this.calMaxCount : 0;
+      let baseColor;
+      if (inRange) {
+        baseColor = hasData
+          ? (ratio > 0.66 ? 'bg-accent-700 hover:bg-accent-800'
+            : ratio > 0.33 ? 'bg-accent-600 hover:bg-accent-700'
+            :                'bg-accent-500 hover:bg-accent-600')
+          : 'bg-accent-200 hover:bg-accent-300';
+      } else if (hasData) {
+        baseColor = ratio > 0.66 ? 'bg-ink-700 hover:bg-ink-900'
+                  : ratio > 0.33 ? 'bg-ink-500 hover:bg-ink-700'
+                  :                'bg-ink-300 hover:bg-ink-500';
+      } else {
+        baseColor = 'bg-cream-300 hover:bg-cream-400';
+      }
+      return baseColor;
+    },
+    isDateInRange(date) {
+      const { from, to } = this.dateRange;
+      if (!from && !to) return false;
+      if (from && to) return date >= from && date <= to;
+      return date === (from || to);
+    },
+    onCalClick(ev, date) {
+      if (ev.shiftKey && (this.dateRange.from || this.dateRange.to)) {
+        // extend selection to span [anchor, date]
+        const anchor = this.dateRange.from || this.dateRange.to;
+        if (date < anchor) { this.dateRange = { from: date, to: anchor }; }
+        else { this.dateRange = { from: anchor, to: date }; }
+      } else {
+        // single-day toggle (click same day to clear)
+        if (this.dateRange.from === date && this.dateRange.to === date) {
+          this.dateRange = { from: null, to: null };
+        } else {
+          this.dateRange = { from: date, to: date };
+        }
+      }
+      this.datePreset = '';
+      this.loadTimeline(true);
+    },
+    applyDatePreset(key) {
+      this.datePreset = key;
+      const today = new Date();
+      const isoDay = (d) => d.toISOString().slice(0,10);
+      const today_s = isoDay(today);
+      if (key === 'all')   { this.dateRange = { from: null, to: null }; }
+      if (key === 'today') { this.dateRange = { from: today_s, to: today_s }; }
+      if (key === '7d') {
+        const f = new Date(today.getTime() - 6*86400000);
+        this.dateRange = { from: isoDay(f), to: today_s };
+      }
+      if (key === '30d') {
+        const f = new Date(today.getTime() - 29*86400000);
+        this.dateRange = { from: isoDay(f), to: today_s };
+      }
+      if (key === '90d') {
+        const f = new Date(today.getTime() - 89*86400000);
+        this.dateRange = { from: isoDay(f), to: today_s };
+      }
+      this.loadTimeline(true);
+    },
+    clearDateRange() {
+      this.dateRange = { from: null, to: null };
+      this.datePreset = 'all';
+      this.loadTimeline(true);
+    },
+    get rangeLabel() {
+      const { from, to } = this.dateRange;
+      if (!from && !to) return '';
+      if (from === to) return from;
+      return (from || '…') + ' → ' + (to || '…');
+    },
+    computeDateBounds() {
+      // Convert YYYY-MM-DD inclusive range to [from_ts, to_ts) unix seconds (UTC).
+      const { from, to } = this.dateRange;
+      let from_ts = null, to_ts = null;
+      if (from) from_ts = Math.floor(new Date(from + 'T00:00:00Z').getTime() / 1000);
+      if (to)   to_ts   = Math.floor(new Date(to   + 'T00:00:00Z').getTime() / 1000) + 86400;
+      return { from_ts, to_ts };
     },
     scrollTimelineTop() {
       document.getElementById('timeline-root').scrollIntoView({ behavior: 'smooth' });

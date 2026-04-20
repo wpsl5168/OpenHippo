@@ -236,14 +236,17 @@ def memories_all(
     agent_id: str | None = None,
     limit: int = 50,
     offset: int = 0,
+    date_from: float | None = None,
+    date_to: float | None = None,
 ):
     """Unified timeline (hot+cold combined) for end-user UI.
-    Supports pagination via limit+offset and filtering by target/agent_id.
+    Supports pagination via limit+offset and filtering by target/agent_id/date range.
+    date_from/date_to are unix timestamps (inclusive lower, exclusive upper).
     Returns {items, total, has_more} envelope for infinite-scroll UIs.
     """
     e = _engine()
-    items = e.unified_timeline(target, agent_id, limit, offset)
-    total = e.unified_count(target, agent_id)
+    items = e.unified_timeline(target, agent_id, limit, offset, date_from, date_to)
+    total = e.unified_count(target, agent_id, date_from, date_to)
     return {"data": {
         "items": items,
         "total": total,
@@ -251,6 +254,19 @@ def memories_all(
         "limit": limit,
         "has_more": offset + len(items) < total,
     }}
+
+
+@app.get("/v1/calendar")
+def get_calendar(
+    target: str | None = None,
+    agent_id: str | None = None,
+    days: int = 365,
+):
+    """Daily memory counts over the past N days (default 365).
+    Returns [{date: 'YYYY-MM-DD', count: N}] sorted oldest→newest.
+    Used to power the date-range scrubber / heatmap calendar in the UI.
+    """
+    return {"data": _engine().daily_calendar(target, agent_id, days)}
 
 @app.get("/v1/logs")
 def get_logs(limit: int = 50):

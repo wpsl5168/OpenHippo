@@ -378,13 +378,22 @@ class HippoEngine:
 
     def unified_timeline(self, target: str | None = None,
                          agent_id: str | None = None,
-                         limit: int = 50, offset: int = 0) -> list[dict]:
+                         limit: int = 50, offset: int = 0,
+                         date_from: float | None = None,
+                         date_to: float | None = None) -> list[dict]:
         """Combined hot+cold timeline for end-user UI."""
-        return self.storage.unified_timeline(target, agent_id, limit, offset)
+        return self.storage.unified_timeline(target, agent_id, limit, offset, date_from, date_to)
 
     def unified_count(self, target: str | None = None,
-                      agent_id: str | None = None) -> int:
-        return self.storage.unified_count(target, agent_id)
+                      agent_id: str | None = None,
+                      date_from: float | None = None,
+                      date_to: float | None = None) -> int:
+        return self.storage.unified_count(target, agent_id, date_from, date_to)
+
+    def daily_calendar(self, target: str | None = None,
+                       agent_id: str | None = None,
+                       days: int = 365) -> list[dict]:
+        return self.storage.daily_calendar(target, agent_id, days)
 
     # ── Logs ──
 
