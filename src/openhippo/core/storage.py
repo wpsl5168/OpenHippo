@@ -275,34 +275,46 @@ class Storage:
         ).fetchone()
         return dict(row) if row else None
 
-    def cold_search(self, query: str, target: str | None = None, limit: int = 20) -> list[dict]:
+    def cold_search(self, query: str, target: str | None = None, limit: int = 20,
+                    include_consolidated: bool = False) -> list[dict]:
+        """Search cold memory with FTS5 fallback to LIKE.
+
+        By default, rows merged into a seed by Dream (dream_status='consolidated')
+        are hidden — only the seed surfaces. Pass include_consolidated=True for
+        full audit views.
+        """
         conn = self._get_conn()
+        # Build the dream-status filter as a SQL fragment we can append to either branch.
+        status_clause = "" if include_consolidated else \
+            " AND COALESCE(cm.dream_status, 'active') != 'consolidated'"
+        like_status_clause = "" if include_consolidated else \
+            " AND COALESCE(dream_status, 'active') != 'consolidated'"
         try:
             if target:
                 rows = conn.execute(
-                    """SELECT cm.* FROM cold_memory_fts fts
+                    f"""SELECT cm.* FROM cold_memory_fts fts
                        JOIN cold_memory cm ON cm.rowid = fts.rowid
-                       WHERE cold_memory_fts MATCH ? AND cm.target = ?
+                       WHERE cold_memory_fts MATCH ? AND cm.target = ?{status_clause}
                        ORDER BY rank LIMIT ?""",
                     (query, target, limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    """SELECT cm.* FROM cold_memory_fts fts
+                    f"""SELECT cm.* FROM cold_memory_fts fts
                        JOIN cold_memory cm ON cm.rowid = fts.rowid
-                       WHERE cold_memory_fts MATCH ?
+                       WHERE cold_memory_fts MATCH ?{status_clause}
                        ORDER BY rank LIMIT ?""",
                     (query, limit),
                 ).fetchall()
         except Exception:
             if target:
                 rows = conn.execute(
-                    "SELECT * FROM cold_memory WHERE content LIKE ? AND target=? LIMIT ?",
+                    f"SELECT * FROM cold_memory WHERE content LIKE ? AND target=?{like_status_clause} LIMIT ?",
                     (f"%{query}%", target, limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM cold_memory WHERE content LIKE ? LIMIT ?",
+                    f"SELECT * FROM cold_memory WHERE content LIKE ?{like_status_clause} LIMIT ?",
                     (f"%{query}%", limit),
                 ).fetchall()
 

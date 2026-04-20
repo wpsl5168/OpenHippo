@@ -1,13 +1,16 @@
 """Dream cycle — sleep-inspired consolidation engine for cold memory.
 
-Stages (PR-1 implements only Recall+Cluster+Preview):
-    1. Recall   — fetch candidate cold memories (active, has embedding)
-    2. Cluster  — greedy single-link clustering by L2 distance < threshold
-    3. Consolidate (PR-2) — merge each cluster into a seed, mark sources as 'consolidated'
-    4. Forget (PR-3) — soft-mark low-importance / stale memories as 'dormant'
+Stages:
+    1. Recall      — fetch candidate cold memories (active, has embedding)
+    2. Cluster     — greedy single-link clustering by L2 distance < threshold
+    3. Consolidate — merge each cluster into a seed, mark members as 'consolidated' (PR-2)
+    4. Forget      — soft-mark low-importance / stale memories as 'dormant' (PR-3, off by default)
 
-Design principle: preview() must be SIDE-EFFECT FREE so老王 can dry-run
-before any destructive action. Records a 'preview' run in dream_runs for audit.
+Design principles:
+- preview() is SIDE-EFFECT FREE — dry-run before any destructive action.
+- consolidate() is REVERSIBLE — original rows are not deleted, only marked
+  with consolidated_into=<seed_id> and dream_status='consolidated'.
+- Every action emits a dream_actions audit row keyed by dream_run_id.
 """
 
 from __future__ import annotations
@@ -49,7 +52,7 @@ class DreamConfig:
             "knn_fetch": self.knn_fetch,
             "target": self.target,
             "enable_forget": self.enable_forget,
-            "version": "f5-pr1",
+            "version": "f5-pr2",
         }
 
 
@@ -94,6 +97,33 @@ class DreamPreview:
                 }
                 for c in self.clusters
             ],
+        }
+
+
+@dataclass
+class DreamRunResult:
+    """Outcome of a real (non-preview) dream cycle."""
+    run_id: str
+    candidates_count: int
+    clusters_count: int
+    consolidated_count: int        # number of member rows merged into seeds
+    seeds_updated: int             # number of seed rows mutated
+    forgotten_count: int           # PR-3 (always 0 in PR-2)
+    duration_ms: int
+    started_at: float
+    config: dict
+
+    def to_dict(self) -> dict:
+        return {
+            "run_id": self.run_id,
+            "candidates_count": self.candidates_count,
+            "clusters_count": self.clusters_count,
+            "consolidated_count": self.consolidated_count,
+            "seeds_updated": self.seeds_updated,
+            "forgotten_count": self.forgotten_count,
+            "duration_ms": self.duration_ms,
+            "started_at": self.started_at,
+            "config": self.config,
         }
 
 
@@ -254,6 +284,218 @@ class DreamEngine:
             conn.commit()
             logger.exception("dream preview failed: %s", e)
             raise
+
+    # ── Stage 3: Consolidate (mutating) ──
+    def consolidate(self, cfg: DreamConfig | None = None) -> DreamRunResult:
+        """Run a full dream cycle that actually mutates cold memory.
+
+        Process per cluster:
+          1. Pick seed (oldest in cluster — has earliest created_at).
+             Rationale: oldest is the original observation; later are echoes.
+          2. For each member:
+               - mark dream_status='consolidated', consolidated_into=<seed_id>
+               - record dream_actions row with full snapshot for restore
+          3. Update seed:
+               - merged_from = JSON list of member ids (appended if exists)
+               - importance += sum(member_importance) * 0.3 (capped at 1.0)
+               - access_count += sum(member_access_count)
+               - last_dream_at = now
+               - dream_actions row recording the merge
+
+        Failure handling: each cluster commits independently. A single bad
+        cluster does not poison the whole run — error logged + skipped.
+
+        Reversibility: nothing is deleted. consolidated rows can be restored
+        by setting dream_status='active' and consolidated_into=NULL (PR-3 API).
+        """
+        cfg = cfg or DreamConfig()
+        run_id = str(uuid.uuid4())
+        started = time.time()
+        conn = self.storage._get_conn()
+
+        # Audit: open a 'running' run row
+        conn.execute(
+            """INSERT INTO dream_runs
+               (id, started_at, status, config_snapshot)
+               VALUES (?, ?, 'running', ?)""",
+            (run_id, _iso(started), json.dumps(cfg.to_dict())),
+        )
+        conn.commit()
+
+        consolidated_count = 0
+        seeds_updated = 0
+        candidates: list[dict] = []
+        clusters: list[Cluster] = []
+
+        try:
+            candidates = self._recall_candidates(cfg)
+            clusters = self._cluster(candidates, cfg)
+
+            for cluster in clusters:
+                try:
+                    n_merged = self._apply_consolidation(run_id, cluster)
+                    if n_merged > 0:
+                        consolidated_count += n_merged
+                        seeds_updated += 1
+                except Exception as cluster_err:
+                    logger.exception(
+                        "dream consolidate: cluster %s failed: %s",
+                        cluster.seed_id, cluster_err,
+                    )
+                    # don't break the run
+
+            duration_ms = int((time.time() - started) * 1000)
+            conn.execute(
+                """UPDATE dream_runs
+                   SET finished_at = ?, status = 'completed',
+                       candidates_count = ?, clusters_count = ?,
+                       consolidated_count = ?, forgotten_count = 0
+                   WHERE id = ?""",
+                (
+                    _iso(time.time()),
+                    len(candidates),
+                    len(clusters),
+                    consolidated_count,
+                    run_id,
+                ),
+            )
+            conn.commit()
+
+            return DreamRunResult(
+                run_id=run_id,
+                candidates_count=len(candidates),
+                clusters_count=len(clusters),
+                consolidated_count=consolidated_count,
+                seeds_updated=seeds_updated,
+                forgotten_count=0,
+                duration_ms=duration_ms,
+                started_at=started,
+                config=cfg.to_dict(),
+            )
+        except Exception as e:
+            conn.execute(
+                "UPDATE dream_runs SET status='failed', error=?, finished_at=? WHERE id=?",
+                (str(e), _iso(time.time()), run_id),
+            )
+            conn.commit()
+            logger.exception("dream consolidate failed: %s", e)
+            raise
+
+    def _apply_consolidation(self, run_id: str, cluster: Cluster) -> int:
+        """Merge one cluster atomically. Returns number of members consolidated."""
+        conn = self.storage._get_conn()
+
+        # Fetch full rows so we can decide seed by created_at and capture snapshots
+        all_ids = cluster.all_ids()
+        placeholders = ",".join("?" for _ in all_ids)
+        rows = {
+            r["id"]: dict(r)
+            for r in conn.execute(
+                f"""SELECT id, content, target, created_at, importance, access_count,
+                           merged_from, dream_status, consolidated_into
+                    FROM cold_memory WHERE id IN ({placeholders})""",
+                all_ids,
+            ).fetchall()
+        }
+
+        # Filter out anyone already consolidated by a prior race
+        live = {
+            mid: r for mid, r in rows.items()
+            if (r.get("dream_status") or "active") == "active"
+            and not r.get("consolidated_into")
+        }
+        if len(live) < 2:
+            return 0  # nothing to merge
+
+        # Re-elect seed: oldest among live members (PRD: "保留种子：创建最早的为代表")
+        seed_id = min(live, key=lambda i: live[i]["created_at"] or 0)
+        seed = live[seed_id]
+        member_ids = [mid for mid in live if mid != seed_id]
+        if not member_ids:
+            return 0
+
+        now_iso = _iso(time.time())
+
+        # 1. Mark members as consolidated + audit
+        for mid in member_ids:
+            member = live[mid]
+            conn.execute(
+                """UPDATE cold_memory
+                   SET dream_status = 'consolidated',
+                       consolidated_into = ?,
+                       last_dream_at = ?
+                   WHERE id = ?""",
+                (seed_id, now_iso, mid),
+            )
+            conn.execute(
+                """INSERT INTO dream_actions
+                   (dream_run_id, action, memory_id, details, created_at)
+                   VALUES (?, 'consolidate_member', ?, ?, ?)""",
+                (
+                    run_id, mid,
+                    json.dumps({
+                        "merged_into": seed_id,
+                        "snapshot": {
+                            "content": member["content"],
+                            "target": member["target"],
+                            "importance": member.get("importance"),
+                            "access_count": member.get("access_count"),
+                            "created_at": member.get("created_at"),
+                        },
+                        "cluster_size": len(live),
+                        "avg_distance": cluster.avg_distance,
+                    }),
+                    now_iso,
+                ),
+            )
+
+        # 2. Update seed: merged_from, importance, access_count
+        existing_merged: list[str] = []
+        if seed.get("merged_from"):
+            try:
+                existing_merged = json.loads(seed["merged_from"])
+                if not isinstance(existing_merged, list):
+                    existing_merged = []
+            except (ValueError, TypeError):
+                existing_merged = []
+        new_merged = list(dict.fromkeys(existing_merged + member_ids))  # de-dup, preserve order
+
+        member_importance_sum = sum(
+            float(live[m].get("importance") or 0.5) for m in member_ids
+        )
+        member_access_sum = sum(
+            int(live[m].get("access_count") or 0) for m in member_ids
+        )
+        seed_imp = float(seed.get("importance") or 0.5)
+        new_importance = min(1.0, seed_imp + member_importance_sum * 0.3)
+        new_access = int(seed.get("access_count") or 0) + member_access_sum
+
+        conn.execute(
+            """UPDATE cold_memory
+               SET merged_from = ?,
+                   importance = ?,
+                   access_count = ?,
+                   last_dream_at = ?
+               WHERE id = ?""",
+            (json.dumps(new_merged), new_importance, new_access, now_iso, seed_id),
+        )
+        conn.execute(
+            """INSERT INTO dream_actions
+               (dream_run_id, action, memory_id, details, created_at)
+               VALUES (?, 'consolidate_seed', ?, ?, ?)""",
+            (
+                run_id, seed_id,
+                json.dumps({
+                    "absorbed": member_ids,
+                    "importance_before": seed_imp,
+                    "importance_after": new_importance,
+                    "access_count_after": new_access,
+                }),
+                now_iso,
+            ),
+        )
+        conn.commit()
+        return len(member_ids)
 
     # ── Run history ──
     def list_runs(self, limit: int = 20) -> list[dict]:

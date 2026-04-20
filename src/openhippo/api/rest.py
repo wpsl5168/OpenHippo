@@ -328,3 +328,55 @@ def dream_runs_list(limit: int = 20):
     from ..core.dream import DreamEngine
     eng = DreamEngine(_engine().storage)
     return {"data": eng.list_runs(limit=limit)}
+
+
+class DreamRunRequest(BaseModel):
+    target: str | None = Field(None, description="Restrict to 'memory' or 'user'; None = all")
+    l2_threshold: float = Field(0.55, ge=0.1, le=2.0)
+    min_cluster_size: int = Field(2, ge=2, le=20)
+    max_candidates: int = Field(500, ge=1, le=5000)
+    knn_fetch: int = Field(20, ge=2, le=100)
+
+
+@app.post("/v1/dream/run")
+def dream_run(req: DreamRunRequest):
+    """Execute a real dream cycle that consolidates similar cold memories.
+
+    This MUTATES data: cluster members get dream_status='consolidated' and
+    consolidated_into=<seed_id>. Originals are preserved (not deleted) so a
+    future restore endpoint can roll back. Forget stage is OFF in PR-2.
+
+    PRD: "记忆 Agent 全自动无感知运行"; this is the manual trigger.
+    Auto-scheduling lands in PR-3.
+    """
+    from ..core.dream import DreamConfig, DreamEngine
+    cfg = DreamConfig(
+        target=req.target,
+        l2_threshold=req.l2_threshold,
+        min_cluster_size=req.min_cluster_size,
+        max_candidates=req.max_candidates,
+        knn_fetch=req.knn_fetch,
+        enable_forget=False,  # PR-3
+    )
+    eng = DreamEngine(_engine().storage)
+    return {"data": eng.consolidate(cfg).to_dict()}
+
+
+@app.get("/v1/dream/runs/{run_id}")
+def dream_run_detail(run_id: str):
+    """Single dream run + ordered list of dream_actions for full audit trail."""
+    from ..core.dream import DreamEngine
+    eng = DreamEngine(_engine().storage)
+    conn = eng.storage._get_conn()
+    run_row = conn.execute(
+        "SELECT * FROM dream_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    if not run_row:
+        raise HTTPException(status_code=404, detail=f"dream run {run_id} not found")
+    actions = [
+        dict(r) for r in conn.execute(
+            "SELECT * FROM dream_actions WHERE dream_run_id = ? ORDER BY id ASC",
+            (run_id,),
+        ).fetchall()
+    ]
+    return {"data": {"run": dict(run_row), "actions": actions}}
