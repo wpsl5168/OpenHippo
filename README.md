@@ -133,7 +133,15 @@ curl http://localhost:8200/v1/stats
 | `GET` | `/v1/stats` | Storage statistics |
 | `GET` | `/v1/logs` | Operation audit log |
 | `POST` | `/v1/embeddings/backfill` | Generate missing embeddings |
+| `POST` | `/v1/dream/preview` | Preview consolidation clusters (non-mutating) |
+| `POST` | `/v1/dream/run` | Execute a dream cycle (consolidate + optional forget) |
+| `POST` | `/v1/dream/restore/{id}` | Reverse a consolidate/forget action |
+| `GET` | `/v1/dream/runs` | List recent dream cycles |
+| `GET` | `/v1/dream/runs/{id}` | Single dream run + audit trail |
+| `GET` | `/v1/dream/metrics` | Persistent + scheduler observability snapshot |
 | `GET` | `/health` | Health check |
+
+> See [`docs/F5_DREAM.md`](docs/F5_DREAM.md) for the full F5 Dream guide — staging model, configuration, auto-scheduler, and observability.
 
 ## Configuration
 
@@ -237,9 +245,10 @@ mypy src/
 - [x] Bearer token authentication
 - [x] Docker image and compose deployment
 - [x] Remote agent connection (multi-VM support)
+- [x] F5 Dream — sleep-inspired memory consolidation (cluster + consolidate + soft forget + restore)
+- [x] Auto-scheduler with metrics observability (`/v1/dream/metrics`)
 - [ ] Multi-tenant support
 - [ ] Web UI for memory inspection
-- [ ] Scheduled memory consolidation (auto-summarize)
 - [ ] Webhook / event-driven memory triggers
 
 ## License
