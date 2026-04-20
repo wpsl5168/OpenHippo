@@ -20,12 +20,9 @@ embedding:
   #   model: "text-embedding-3-small"
   #   api_key: ""
 
-auth:
-  enabled: false
-  # tokens:
-  #   - name: "hermes-agent"
-  #     token: "hpc_your_token_here"
-  #     scopes: ["memory:read", "memory:write"]
+# OpenHippo is local-first with NO built-in auth.
+# For remote access, put a reverse proxy with auth in front.
+# See README → Remote Access for recommended patterns.
 
 logging:
   level: "INFO"

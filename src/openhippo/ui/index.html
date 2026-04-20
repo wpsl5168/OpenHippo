@@ -35,19 +35,8 @@
     <button @click="exportAll()" class="px-3 py-1.5 text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded-md flex items-center gap-1">
       <span>⬇</span> 导出全部
     </button>
-    <button @click="showSettings = !showSettings" class="px-2 py-1.5 text-slate-500 hover:text-slate-900" title="设置 Token">⚙</button>
   </div>
 </header>
-
-<!-- Settings drawer -->
-<div x-show="showSettings" x-transition class="bg-amber-50 border-b border-amber-200">
-  <div class="max-w-7xl mx-auto px-4 py-3 flex items-center gap-2">
-    <label class="text-sm text-slate-700">Bearer Token:</label>
-    <input type="password" x-model="token" @blur="saveToken()" placeholder="粘贴 token 后失焦保存"
-           class="flex-1 px-2 py-1 text-sm border border-amber-300 rounded font-mono">
-    <button @click="reload()" class="px-3 py-1 text-sm bg-amber-600 text-white rounded">应用</button>
-  </div>
-</div>
 
 <!-- Notify -->
 <div x-show="notice" x-transition class="fixed top-20 right-4 z-50 px-4 py-2 rounded-lg shadow-lg text-sm"
@@ -200,8 +189,6 @@ function hippoApp() {
   return {
     // State
     version: 'v0.3.0',
-    token: localStorage.getItem('hippo_token') || '',
-    showSettings: false,
     loading: false,
     notice: '', noticeType: 'ok',
     stats: {},
@@ -238,15 +225,12 @@ function hippoApp() {
 
     // Init
     async init() {
-      if (!this.token) this.showSettings = true;
       await this.reload();
     },
-    saveToken() { localStorage.setItem('hippo_token', this.token); this.notify('Token 已保存'); },
 
     // API
     async api(method, path, body) {
       const opts = { method, headers: {} };
-      if (this.token) opts.headers['Authorization'] = 'Bearer ' + this.token;
       if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
       const res = await fetch(path, opts);
       if (!res.ok) {

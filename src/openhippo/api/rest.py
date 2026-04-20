@@ -16,9 +16,10 @@ from pydantic import BaseModel, Field
 
 from ..core.engine import HippoEngine
 
-# Auth middleware (loaded from config)
+# Auth removed in v0.4: OpenHippo is local-first.
+# For remote deployments, use a reverse proxy with auth (Caddy + Cloudflare Access,
+# Nginx + OAuth2-Proxy, Tailscale, WireGuard, etc.). See README → Remote Access.
 from ..core.config import get_config, get as cfg_get
-from .auth import BearerAuthMiddleware
 
 
 logger = logging.getLogger(__name__)
@@ -128,11 +129,10 @@ app = FastAPI(
 )
 
 _conf = get_config()
-app.add_middleware(
-    BearerAuthMiddleware,
-    enabled=cfg_get(_conf, "auth.enabled", False),
-    tokens=cfg_get(_conf, "auth.tokens", []),
-)
+# NOTE: OpenHippo is a local-first service. It binds to 127.0.0.1 by default
+# and ships with NO authentication. If you expose it remotely, put a reverse
+# proxy with proper auth (e.g. Caddy + Cloudflare Access, Nginx + OAuth2-Proxy,
+# Tailscale, WireGuard) in front of it. See README → Remote Access.
 
 
 def _engine() -> HippoEngine:

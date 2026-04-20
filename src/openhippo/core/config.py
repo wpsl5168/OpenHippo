@@ -49,10 +49,6 @@ DEFAULTS: dict[str, Any] = {
             "api_key": "",
         },
     },
-    "auth": {
-        "enabled": False,
-        "tokens": [],  # [{name, token, scopes}]
-    },
     "logging": {
         "level": "INFO",
     },
@@ -70,7 +66,6 @@ ENV_MAP = {
     "HIPPO_LOCAL_DEVICE": "embedding.local.device",
     "HIPPO_OPENAI_API_KEY": "embedding.openai.api_key",
     "HIPPO_OPENAI_MODEL": "embedding.openai.model",
-    "HIPPO_AUTH_ENABLED": "auth.enabled",
     "HIPPO_LOG_LEVEL": "logging.level",
 }
 
@@ -84,8 +79,6 @@ def _set_nested(d: dict, dotpath: str, value: Any) -> None:
     final_key = keys[-1]
     if final_key == "port":
         value = int(value)
-    elif final_key == "enabled":
-        value = value.lower() in ("true", "1", "yes")
     d[final_key] = value
 
 
@@ -123,12 +116,6 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
             logger.warning("Failed to load config from %s: %s", path, e)
     else:
         logger.debug("No config file at %s, using defaults", path)
-
-    # Single-token shortcut: HIPPO_AUTH_TOKEN="my-secret" enables auth automatically
-    single_token = os.environ.get("HIPPO_AUTH_TOKEN")
-    if single_token:
-        _set_nested(config, "auth.enabled", "true")
-        config["auth"]["tokens"] = [{"name": "env-token", "token": single_token, "scopes": ["*"]}]
 
     # Apply environment variable overrides
     for env_var, dotpath in ENV_MAP.items():

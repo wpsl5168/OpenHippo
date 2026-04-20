@@ -20,9 +20,6 @@ _DB_PATH = str(Path(_TMP_DIR) / "memory.db")
 
 os.environ["HIPPO_DB_PATH"] = _DB_PATH
 os.environ["OPENHIPPO_DREAM_AUTO"] = "0"  # don't run background loop in tests
-# Disable auth so existing tests (which don't set bearer tokens) keep passing.
-os.environ.pop("HIPPO_AUTH_TOKEN", None)
-os.environ.pop("HIPPO_AUTH_ENABLED", None)
 
 
 @pytest.fixture(scope="session")

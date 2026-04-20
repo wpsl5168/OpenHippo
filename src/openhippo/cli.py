@@ -19,10 +19,21 @@ def main():
 
 
 @main.command()
-@click.option("--host", default="127.0.0.1", help="Bind address")
+@click.option("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1, local-only)")
 @click.option("--port", default=8200, help="Port number")
 def serve(host: str, port: int):
-    """Start the REST API server."""
+    """Start the REST API server.
+
+    OpenHippo binds to 127.0.0.1 by default and ships with NO authentication.
+    For remote access, put a reverse proxy (Caddy / Nginx / Tailscale) with
+    auth in front. See README → Remote Access.
+    """
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        click.secho(
+            f"⚠️  Binding to {host} exposes OpenHippo on the network with NO auth.\n"
+            f"   Make sure a reverse proxy with authentication is in front.",
+            fg="yellow", err=True,
+        )
     click.echo(f"🦛 OpenHippo server starting on {host}:{port}")
     import uvicorn
     uvicorn.run("openhippo.api.rest:app", host=host, port=port, reload=False)

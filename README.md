@@ -46,8 +46,8 @@ Most agent memory solutions (Mem0, Zep, etc.) are either cloud-hosted or tightly
 ┌──────────────┐            ┌──────────────┐
 │  Plugin/Hook │            │   REST API   │
 │  (pre_llm    │            │  (FastAPI)   │
-│   post_llm   │            │  + Bearer    │
-│   post_tool) │            │    Auth      │
+│   post_llm   │            │  127.0.0.1   │
+│   post_tool) │            │  no auth     │
 └──────┬───────┘            └──────┬───────┘
        │                          │
        └────────────┬─────────────┘
@@ -205,14 +205,40 @@ OpenHippo integrates with AI agents via a **hook/plugin system** — no manual A
 # Copy plugin to agent's plugin directory
 cp -r plugin/hermes ~/.hermes/plugins/openhippo
 
-# Configure endpoint (local or remote)
-export HIPPO_BASE_URL=http://localhost:8200   # or remote server
-export HIPPO_TOKEN=your-secret-token          # if auth enabled
+# Configure endpoint (local)
+export HIPPO_BASE_URL=http://localhost:8200
 
 # Restart your agent — done. Memory sync is fully automatic.
 ```
 
 **Offline resilience:** When OpenHippo is unreachable, writes are cached to a local WAL (Write-Ahead Log) and replayed automatically on reconnection.
+
+## Remote Access (Advanced)
+
+OpenHippo is **local-first**. By default it binds to `127.0.0.1` and ships with **no authentication** — your memories never leave the loopback interface.
+
+If you want to access OpenHippo from another machine (e.g. your phone, a remote agent), **do not just `--host 0.0.0.0`**. Put a reverse proxy with proper authentication in front. Recommended patterns:
+
+| Setup | Best For | Difficulty |
+|---|---|---|
+| **Tailscale / WireGuard** | Personal remote access, no public DNS | ⭐ easy |
+| **Caddy + Cloudflare Access** (Email OTP / SSO) | Public domain, single user / small team | ⭐⭐ medium |
+| **Nginx + OAuth2-Proxy** (GitHub / Google) | Self-hosted, full control | ⭐⭐⭐ harder |
+
+**Minimal Caddy + Cloudflare Access example** (replace `hippo.example.com`):
+
+```caddyfile
+hippo.example.com {
+    tls {
+        dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+    }
+    reverse_proxy 127.0.0.1:8200
+}
+```
+
+Then in Cloudflare Zero Trust → Access → Applications, add a Self-hosted app for `hippo.example.com` with an Email OTP policy restricted to your address.
+
+> ⚠️ **Without auth in front, anyone on the network can read, edit, and delete every memory in your database.** OpenHippo intentionally does not implement auth itself — battle-tested reverse proxies do it better.
 
 ## Development
 
