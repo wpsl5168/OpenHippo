@@ -1,404 +1,707 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OpenHippo · 记忆面板</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>海马体 · OpenHippo</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://cdn.tailwindcss.com"></script>
-<script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          ink: { 900:'#1a1a1a', 700:'#4a4a4a', 500:'#78716c', 400:'#a8a29e' },
+          cream: { 50:'#fdfcf9', 100:'#faf8f2', 200:'#f0ece0' },
+          accent: { 50:'#f5f3ff', 100:'#ede9fe', 500:'#7c6eea', 600:'#6554d8', 700:'#5544bf' },
+        },
+        fontFamily: {
+          sans: ['-apple-system','BlinkMacSystemFont','"PingFang SC"','"Microsoft YaHei"','system-ui','sans-serif'],
+          serif: ['"Noto Serif SC"','"Songti SC"','Georgia','serif'],
+          mono: ['"JetBrains Mono"','"SF Mono"','Menlo','Consolas','monospace'],
+        },
+        boxShadow: {
+          card: '0 1px 2px rgba(15,15,15,.04), 0 2px 6px rgba(15,15,15,.03)',
+          cardHover: '0 2px 4px rgba(15,15,15,.06), 0 8px 24px rgba(15,15,15,.06)',
+        }
+      }
+    }
+  };
+</script>
 <style>
-[x-cloak]{display:none!important}
-.bar{height:6px;background:#e2e8f0;border-radius:9999px;overflow:hidden}
-.bar>div{height:100%;background:linear-gradient(90deg,#6366f1,#a855f7);transition:width .4s}
-.tag{display:inline-block;padding:2px 10px;margin:3px;border-radius:9999px;background:#eef2ff;color:#4338ca;font-size:12px;cursor:pointer;transition:all .15s;border:1px solid transparent}
-.tag:hover{background:#6366f1;color:#fff}
-.tag.active{background:#4338ca;color:#fff;border-color:#312e81}
-.spark{display:flex;align-items:flex-end;gap:2px;height:48px}
-.spark>div{flex:1;background:linear-gradient(to top,#a855f7,#c4b5fd);border-radius:2px 2px 0 0;min-height:2px;transition:height .3s}
-.spark>div:hover{background:#6366f1}
-.scroll-thin::-webkit-scrollbar{width:6px}
-.scroll-thin::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:3px}
-.fade{animation:fade .3s}
-@keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+  html, body { background: #fdfcf9; }
+  body { font-feature-settings: "palt"; }
+  ::selection { background: #ede9fe; color: #1a1a1a; }
+  html { scroll-behavior: smooth; }
+  mark.hippo-mark { background: #fde68a; color: #1a1a1a; padding: 0 2px; border-radius: 3px; }
+  @keyframes flashIn {
+    0%   { background-color: #ede9fe; box-shadow: 0 0 0 4px #c7bff5; }
+    60%  { background-color: #faf8ff; box-shadow: 0 0 0 2px #c7bff5; }
+    100% { background-color: #ffffff; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+  }
+  .flash { animation: flashIn 2.2s ease-out; }
+  .spark-bar { transition: background-color .15s ease; }
+  .spark-bar:hover { background-color: #5544bf !important; }
+  .dot { width: 6px; height: 6px; border-radius: 999px; display: inline-block; }
+  .day-divider { position: relative; }
+  .day-divider::before { content: ''; position: absolute; left: 0; right: 0; top: 50%; height: 1px; background: #e7e2d0; z-index: 0; }
+  .day-divider > span { position: relative; z-index: 1; background: #fdfcf9; padding: 0 14px; }
+  .content-fade { position: relative; max-height: 9rem; overflow: hidden; }
+  .content-fade::after {
+    content: ''; position: absolute; left: 0; right: 0; bottom: 0; height: 3.5rem;
+    background: linear-gradient(180deg, transparent, #ffffff 85%);
+    pointer-events: none;
+  }
+  .backdrop { background: rgba(26, 26, 26, .45); backdrop-filter: blur(4px); }
+  input:focus { outline: none; }
+
+  /* Timeline spine */
+  .tl-spine { position: relative; padding-left: 2.5rem; }
+  .tl-spine::before {
+    content: ''; position: absolute; left: 0.9375rem; top: 8px; bottom: 8px;
+    width: 2px; background: #e7e2d0;
+    border-radius: 2px;
+  }
+  .tl-node { position: relative; }
+  .tl-node::before {
+    content: ''; position: absolute; left: -1.9375rem; top: 1.5rem;
+    width: 14px; height: 14px; border-radius: 999px;
+    background: #c7bff5;
+    border: 3px solid #fdfcf9;
+    box-shadow: 0 0 0 1px rgba(124,110,234,.25);
+    z-index: 2;
+    transition: transform .2s ease, box-shadow .2s ease;
+  }
+  .tl-node:hover::before {
+    transform: scale(1.15);
+    box-shadow: 0 0 0 4px rgba(124,110,234,.15);
+  }
+  .tl-node.target-user::before { background: #f59e0b; box-shadow: 0 0 0 1px rgba(245,158,11,.3); }
+  .tl-node.target-user:hover::before { box-shadow: 0 0 0 4px rgba(245,158,11,.18); }
+  .tl-node.target-memory::before { background: #10b981; box-shadow: 0 0 0 1px rgba(16,185,129,.3); }
+  .tl-node.target-memory:hover::before { box-shadow: 0 0 0 4px rgba(16,185,129,.18); }
+
+  /* Card left-accent band */
+  .tl-node.target-user { border-left: 4px solid #f59e0b; }
+  .tl-node.target-memory { border-left: 4px solid #10b981; }
+
+  /* Enter animation */
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  .tl-node { animation: fadeUp .35s ease-out both; }
+
+  /* Content typography */
+  .hippo-body {
+    font-family: "Noto Serif SC", "Songti SC", Georgia, serif;
+    font-size: 15.5px; line-height: 1.85; color: #1a1a1a;
+    font-weight: 400;
+  }
+  .hippo-body code,
+  .hippo-body .mono {
+    font-family: "JetBrains Mono", "SF Mono", Menlo, monospace;
+    font-size: 0.86em;
+    background: #f5f3ed; padding: 1px 5px; border-radius: 4px;
+    color: #4a4a4a;
+  }
+
+  /* Pill tags */
+  .pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11px; font-weight: 500; padding: 2px 9px;
+    border-radius: 999px; letter-spacing: .02em;
+  }
+  .pill-user { background: #fef3c7; color: #92400e; }
+  .pill-memory { background: #d1fae5; color: #065f46; }
+
+  /* kbd key */
+  kbd.key { font-family: "JetBrains Mono", monospace; font-size: 10px; padding: 1px 5px; background: #ffffff; border: 1px solid #e7e2d0; border-bottom-width: 2px; border-radius: 4px; color: #4a4a4a; }
+
+  /* Big number */
+  .big-num { font-family: "Noto Serif SC", Georgia, serif; font-weight: 700; font-feature-settings: "tnum"; line-height: 1; letter-spacing: -0.02em; }
 </style>
 </head>
-<body class="bg-slate-50 text-slate-900" x-data="hippoApp()" x-init="init()" x-cloak>
+<body class="font-sans text-ink-900 antialiased" x-data="hippo()" x-init="init()" x-cloak>
 
-<!-- Header -->
-<header class="bg-white border-b border-slate-200 sticky top-0 z-10">
-  <div class="max-w-7xl mx-auto px-4 py-3 flex items-center gap-3">
-    <div class="w-9 h-9 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-500 flex items-center justify-center text-white text-lg">🧠</div>
-    <div class="flex-1">
-      <h1 class="font-bold text-lg leading-none">OpenHippo</h1>
-      <div class="text-xs text-slate-500" x-text="version"></div>
+<!-- ═══════════ HEADER ═══════════ -->
+<header class="sticky top-0 z-40 bg-cream-50/90 backdrop-blur border-b border-cream-200">
+  <div class="max-w-6xl mx-auto px-4 md:px-6 h-14 flex items-center gap-3">
+    <div class="flex items-center gap-2 shrink-0">
+      <span class="text-xl">🦛</span>
+      <span class="font-serif text-lg tracking-tight text-ink-900">海马体</span>
     </div>
-    <button @click="exportAll()" class="px-3 py-1.5 text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded-md flex items-center gap-1">
-      <span>⬇</span> 导出全部
+    <!-- Search -->
+    <div class="flex-1 relative max-w-2xl mx-auto" @click.outside="showSuggest=false">
+      <div class="relative">
+        <svg class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-ink-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-4.35-4.35M17 10.5a6.5 6.5 0 11-13 0 6.5 6.5 0 0113 0z"/></svg>
+        <input
+          type="search"
+          x-model="query"
+          @input.debounce.180ms="doSuggest()"
+          @focus="if(query.length>=2) showSuggest=true"
+          @keydown.enter.prevent="commitSearch()"
+          @keydown.escape.prevent="clearSearch()"
+          placeholder="搜索你的记忆…"
+          class="w-full pl-10 pr-20 py-2 bg-white border border-cream-200 rounded-full text-sm placeholder-ink-400 focus:border-accent-500 focus:ring-2 focus:ring-accent-100 transition" />
+        <div class="absolute right-10 top-1/2 -translate-y-1/2 flex items-center gap-1 pointer-events-none" x-show="!query">
+          <kbd class="key">⌘</kbd><kbd class="key">K</kbd>
+        </div>
+        <button x-show="query" @click="clearSearch()" class="absolute right-3 top-1/2 -translate-y-1/2 text-ink-400 hover:text-ink-900">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <!-- Suggest dropdown -->
+      <div x-show="showSuggest && suggestions.length" x-transition class="absolute mt-2 w-full bg-white border border-cream-200 rounded-xl shadow-cardHover overflow-hidden z-50">
+        <div class="px-4 py-2 text-xs text-ink-500 bg-cream-100 border-b border-cream-200 flex items-center justify-between">
+          <span>找到 <span x-text="suggestions.length"></span> 条 · 按 <kbd class="px-1 py-0.5 bg-white border border-cream-200 rounded text-[10px]">Enter</kbd> 在时间轴中浏览</span>
+        </div>
+        <div class="max-h-96 overflow-y-auto divide-y divide-cream-200">
+          <template x-for="(s, i) in suggestions" :key="s.id">
+            <button
+              @click="jumpTo(s.id)"
+              class="w-full text-left px-4 py-3 hover:bg-cream-100 transition flex gap-3">
+              <span class="dot shrink-0 mt-1.5" :style="{ background: targetColor(s.target) }"></span>
+              <div class="flex-1 min-w-0">
+                <div class="flex items-center gap-2 text-[11px] text-ink-500 mb-1">
+                  <span class="font-medium" x-text="targetLabel(s.target)"></span>
+                  <span>·</span>
+                  <span x-text="fmtDate(s.created_at)"></span>
+                </div>
+                <div class="text-sm text-ink-900 leading-snug line-clamp-2" x-html="highlight(s.content, query)"></div>
+              </div>
+            </button>
+          </template>
+        </div>
+      </div>
+    </div>
+    <button @click="exportAll()" class="shrink-0 text-sm text-ink-700 hover:text-accent-700 flex items-center gap-1.5 px-3 py-1.5 rounded-lg hover:bg-cream-100 transition">
+      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+      <span class="hidden sm:inline">导出</span>
     </button>
+  </div>
+  <!-- Search breadcrumb -->
+  <div x-show="searchMode" x-transition class="max-w-6xl mx-auto px-4 md:px-6 py-2 flex items-center gap-3 text-sm text-ink-700 border-t border-cream-200">
+    <svg class="w-4 h-4 text-accent-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-4.35-4.35M17 10.5a6.5 6.5 0 11-13 0 6.5 6.5 0 0113 0z"/></svg>
+    <span>搜索 <span class="font-medium text-ink-900">"<span x-text="committedQuery"></span>"</span></span>
+    <span class="text-ink-500">·</span>
+    <span x-show="searchHits.length">
+      已定位 <span class="font-medium" x-text="searchCursor+1"></span> / <span x-text="searchHits.length"></span>
+    </span>
+    <div class="ml-auto flex items-center gap-1">
+      <button @click="navSearch(-1)" :disabled="searchHits.length<2" class="p-1.5 rounded hover:bg-cream-100 disabled:opacity-30 disabled:cursor-not-allowed">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+      </button>
+      <button @click="navSearch(1)" :disabled="searchHits.length<2" class="p-1.5 rounded hover:bg-cream-100 disabled:opacity-30 disabled:cursor-not-allowed">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
+      </button>
+      <button @click="clearSearch()" class="ml-2 px-2.5 py-1 text-xs bg-cream-100 hover:bg-cream-200 rounded-full">清除</button>
+    </div>
   </div>
 </header>
 
-<!-- Notify -->
-<div x-show="notice" x-transition class="fixed top-20 right-4 z-50 px-4 py-2 rounded-lg shadow-lg text-sm"
-     :class="noticeType==='err'?'bg-red-600 text-white':'bg-emerald-600 text-white'" x-text="notice"></div>
+<!-- Top banner notice -->
+<div x-show="notice" x-transition class="max-w-6xl mx-auto px-4 md:px-6 pt-3">
+  <div class="px-4 py-2 rounded-lg text-sm" :class="noticeType==='err' ? 'bg-rose-50 text-rose-700 border border-rose-200' : 'bg-emerald-50 text-emerald-700 border border-emerald-200'" x-text="notice"></div>
+</div>
 
-<main class="max-w-7xl mx-auto px-4 py-6 space-y-6">
+<main class="max-w-6xl mx-auto px-4 md:px-6 py-8">
 
-  <!-- Dashboard -->
-  <section class="grid grid-cols-2 md:grid-cols-4 gap-4">
-    <!-- Total -->
-    <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-100">
-      <div class="text-xs text-slate-500 mb-1">总记忆数</div>
-      <div class="text-3xl font-bold text-slate-900" x-text="totalCount"></div>
-      <div class="text-xs text-slate-400 mt-1">
-        <span class="text-indigo-600" x-text="memCount"></span> memory ·
-        <span class="text-purple-600" x-text="userCount"></span> user
+<!-- ═══════════ OVERVIEW ═══════════ -->
+<section class="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-5 mb-10">
+  <!-- Card 1: total -->
+  <div class="bg-white rounded-2xl border border-cream-200 shadow-card p-6">
+    <div class="text-xs uppercase tracking-widest text-ink-500 font-medium">你的记忆</div>
+    <div class="mt-3 flex items-baseline gap-2">
+      <span class="big-num text-6xl text-ink-900" x-text="overview.total ?? '—'"></span>
+      <span class="text-sm text-ink-500">条</span>
+    </div>
+    <div class="mt-5 space-y-1 text-xs text-ink-500">
+      <div class="flex items-center gap-2">
+        <span class="w-12 text-ink-400">最早</span>
+        <span class="text-ink-700" x-text="overview.earliest_at ? fmtDate(overview.earliest_at) : '—'"></span>
+      </div>
+      <div class="flex items-center gap-2">
+        <span class="w-12 text-ink-400">最近</span>
+        <span class="text-ink-700" x-text="overview.latest_at ? fmtRelative(overview.latest_at) : '—'"></span>
       </div>
     </div>
-    <!-- Memory capacity -->
-    <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-100">
-      <div class="text-xs text-slate-500 mb-1">Memory 容量</div>
-      <div class="text-2xl font-semibold text-slate-900" x-text="stats.hot_memory_usage || '—'"></div>
-      <div class="bar mt-2"><div :style="`width:${memUsagePct}%`"></div></div>
-    </div>
-    <!-- User capacity -->
-    <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-100">
-      <div class="text-xs text-slate-500 mb-1">User 容量</div>
-      <div class="text-2xl font-semibold text-slate-900" x-text="stats.hot_user_usage || '—'"></div>
-      <div class="bar mt-2"><div :style="`width:${userUsagePct}%`"></div></div>
-    </div>
-    <!-- Vector / DB -->
-    <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-100">
-      <div class="text-xs text-slate-500 mb-1">向量 / DB</div>
-      <div class="text-2xl font-semibold text-slate-900">
-        <span x-text="stats.vec_count ?? 0"></span>
-        <span class="text-sm text-slate-400">vec</span>
-      </div>
-      <div class="text-xs text-slate-400 mt-1" x-text="`${(stats.db_size_kb||0).toLocaleString()} KB`"></div>
-    </div>
-  </section>
+    <button @click="scrollTimelineTop()" class="mt-5 text-xs text-accent-600 hover:text-accent-700 flex items-center gap-1">
+      <span>查看时间轴</span>
+      <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"/></svg>
+    </button>
+  </div>
 
-  <!-- Activity + Tags -->
-  <section class="grid grid-cols-1 lg:grid-cols-3 gap-4">
-    <!-- Activity sparkline -->
-    <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-100 lg:col-span-1">
-      <div class="text-sm font-semibold text-slate-700 mb-3">最近 30 天活跃 <span class="text-xs text-slate-400 font-normal" x-text="`(共 ${activitySum} 条)`"></span></div>
-      <div class="spark">
-        <template x-for="(c, i) in activity" :key="i">
-          <div :style="`height:${activityMax ? Math.max(2, c/activityMax*100) : 2}%`"
-               :title="`${activityLabels[i]}: ${c} 条`"></div>
-        </template>
-      </div>
-      <div class="flex justify-between text-[10px] text-slate-400 mt-1">
-        <span>30天前</span><span>今天</span>
-      </div>
+  <!-- Card 2: 30-day activity -->
+  <div class="bg-white rounded-2xl border border-cream-200 shadow-card p-6">
+    <div class="flex items-center justify-between">
+      <div class="text-xs uppercase tracking-widest text-ink-500 font-medium">最近 30 天</div>
+      <div class="text-xs text-ink-500">共 <span class="text-ink-900 font-medium" x-text="recent30Total"></span> 条</div>
     </div>
-
-    <!-- Tag cloud -->
-    <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-100 lg:col-span-2">
-      <div class="flex items-center justify-between mb-3">
-        <div class="text-sm font-semibold text-slate-700">话题标签 <span class="text-xs text-slate-400 font-normal">(从内容自动抽取)</span></div>
-        <button x-show="activeTag" @click="activeTag=''; applyFilter()" class="text-xs text-indigo-600 hover:underline">清除筛选</button>
-      </div>
-      <div x-show="tags.length" class="flex flex-wrap">
-        <template x-for="t in tags" :key="t.name">
-          <span class="tag" :class="activeTag===t.name?'active':''"
-                @click="activeTag = (activeTag===t.name?'':t.name); applyFilter()"
-                :style="`font-size:${10 + Math.min(8, t.count)}px`"
-                x-text="`${t.name} ${t.count}`"></span>
-        </template>
-      </div>
-      <div x-show="!tags.length" class="text-xs text-slate-400">暂无可识别标签</div>
-    </div>
-  </section>
-
-  <!-- Search + List + Detail -->
-  <section class="grid grid-cols-1 lg:grid-cols-5 gap-4">
-    <!-- List -->
-    <div class="lg:col-span-2 bg-white rounded-xl shadow-sm border border-slate-100 flex flex-col" style="max-height:70vh">
-      <div class="p-3 border-b border-slate-100 flex gap-2">
-        <input x-model="searchQuery" @keyup.enter="reload()" @input.debounce.500ms="reload()"
-               placeholder="搜索记忆… 留空显示全部"
-               class="flex-1 px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:border-indigo-500">
-        <button @click="reload()" class="px-3 py-2 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg">↻</button>
-      </div>
-      <div class="px-3 py-2 text-xs text-slate-500 border-b border-slate-50 flex justify-between">
-        <span x-text="`${filteredItems.length} 条${activeTag?' · 标签 '+activeTag:''}${searchQuery?' · 搜索 '+searchQuery:''}`"></span>
-        <span class="text-slate-400" x-show="loading">加载中…</span>
-      </div>
-      <div class="overflow-y-auto scroll-thin flex-1">
-        <template x-for="item in filteredItems" :key="item.id">
-          <div @click="select(item)"
-               :class="selected?.id===item.id ? 'bg-indigo-50 border-l-4 border-l-indigo-500' : 'border-l-4 border-l-transparent hover:bg-slate-50'"
-               class="px-4 py-3 border-b border-slate-50 cursor-pointer fade">
-            <div class="flex items-center gap-2 mb-1">
-              <span class="text-[10px] px-1.5 py-0.5 rounded font-medium"
-                    :class="item.target==='user'?'bg-purple-100 text-purple-700':'bg-indigo-100 text-indigo-700'"
-                    x-text="item.target"></span>
-              <span class="text-[10px] text-slate-400" x-text="formatDate(item.updated_at)"></span>
-            </div>
-            <div class="text-sm text-slate-700 line-clamp-2" x-text="item.content.slice(0, 120)"></div>
-          </div>
-        </template>
-        <div x-show="!loading && !filteredItems.length" class="p-8 text-center text-sm text-slate-400">
-          无匹配记忆
-        </div>
-      </div>
-    </div>
-
-    <!-- Detail -->
-    <div class="lg:col-span-3 bg-white rounded-xl shadow-sm border border-slate-100 p-5" style="min-height:300px">
-      <template x-if="!selected">
-        <div class="h-full flex items-center justify-center text-slate-400 text-sm">
-          ← 从左侧选择一条记忆查看详情
-        </div>
-      </template>
-      <template x-if="selected">
-        <div class="fade">
-          <div class="flex items-center gap-2 mb-3 flex-wrap">
-            <span class="text-xs px-2 py-0.5 rounded font-medium"
-                  :class="selected.target==='user'?'bg-purple-100 text-purple-700':'bg-indigo-100 text-indigo-700'"
-                  x-text="selected.target"></span>
-            <span class="text-xs text-slate-500" x-text="`ID: ${selected.id}`"></span>
-            <span class="text-xs text-slate-400 ml-auto" x-text="formatDateFull(selected.updated_at)"></span>
-          </div>
-          <div class="bg-slate-50 rounded-lg p-4 text-sm text-slate-800 whitespace-pre-wrap font-sans leading-relaxed mb-4"
-               x-text="selected.content"></div>
-          <div class="flex items-center justify-between text-xs text-slate-500">
-            <div>
-              <span x-text="`${selected.content.length} 字`"></span>
-              <span x-show="selected.created_at !== selected.updated_at"> · 创建于 <span x-text="formatDate(selected.created_at)"></span></span>
-            </div>
-            <button @click="remove(selected)" class="px-3 py-1.5 text-sm bg-red-50 hover:bg-red-100 text-red-700 rounded-md">
-              删除此记忆
-            </button>
-          </div>
+    <!-- sparkline -->
+    <div class="mt-5 flex items-end gap-[3px] h-16">
+      <template x-for="d in overview.daily_counts_30d || []" :key="d.date">
+        <div class="flex-1 relative group">
+          <div
+            class="spark-bar rounded-sm cursor-pointer"
+            :style="{
+              height: Math.max(2, (d.count / Math.max(1, spark_max)) * 100) + '%',
+              background: d.count === 0 ? '#e7e2d0' : '#7c6eea',
+              opacity: d.count === 0 ? 0.5 : (0.4 + 0.6 * (d.count / Math.max(1, spark_max)))
+            }"
+            @click="d.count > 0 && scrollToDate(d.date)"
+            :title="d.date + ' · ' + d.count + ' 条'"></div>
         </div>
       </template>
     </div>
-  </section>
+    <div class="mt-3 flex justify-between text-[10px] text-ink-400">
+      <span x-text="overview.daily_counts_30d?.[0]?.date?.slice(5) || ''"></span>
+      <span x-show="recent30Peak">最活跃 <span class="text-ink-700" x-text="recent30Peak"></span></span>
+      <span>今天</span>
+    </div>
+    <div class="mt-4 text-xs text-ink-500">
+      日均 <span class="text-ink-900 font-medium" x-text="(recent30Total / 30).toFixed(1)"></span> 条 · 点击柱子跳转到那天
+    </div>
+  </div>
 
-  <footer class="text-center text-xs text-slate-400 py-4">
-    OpenHippo · Local-first AI memory engine ·
-    <a href="https://github.com/wpsl5168/OpenHippo" target="_blank" class="hover:underline">GitHub</a>
-  </footer>
+  <!-- Card 3: agent distribution doughnut -->
+  <div class="bg-white rounded-2xl border border-cream-200 shadow-card p-6">
+    <div class="flex items-center justify-between">
+      <div class="text-xs uppercase tracking-widest text-ink-500 font-medium">来源分布</div>
+      <div x-show="filter.agent_id" class="text-xs text-accent-600 cursor-pointer hover:underline" @click="setAgentFilter(null)">清除筛选</div>
+    </div>
+    <div class="mt-2 flex items-center gap-4">
+      <div class="relative w-28 h-28 shrink-0">
+        <canvas id="agentChart"></canvas>
+        <div class="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+          <span class="big-num text-2xl text-ink-900" x-text="(overview.by_agent?.length) || 0"></span>
+          <span class="text-[10px] text-ink-500 uppercase tracking-wider">Agent</span>
+        </div>
+      </div>
+      <div class="flex-1 min-w-0 space-y-1.5">
+        <template x-for="(a, i) in overview.by_agent || []" :key="a.key">
+          <button
+            @click="setAgentFilter(a.key === filter.agent_id ? null : a.key)"
+            class="w-full flex items-center gap-2 text-xs text-left px-2 py-1 rounded hover:bg-cream-100 transition"
+            :class="filter.agent_id === a.key ? 'bg-accent-50' : ''">
+            <span class="dot" :style="{ background: agentColor(i) }"></span>
+            <span class="flex-1 truncate" x-text="a.label"></span>
+            <span class="text-ink-500 tabular-nums" x-text="a.count"></span>
+          </button>
+        </template>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ TIMELINE ═══════════ -->
+<section id="timeline-root">
+  <div class="flex items-center justify-between mb-5">
+    <h2 class="font-serif text-2xl text-ink-900">时间轴</h2>
+    <div class="text-xs text-ink-500" x-show="timeline.length">
+      已加载 <span class="text-ink-900 font-medium" x-text="timeline.length"></span>
+      <span x-show="timelineTotal"> / <span x-text="timelineTotal"></span></span>
+    </div>
+  </div>
+
+  <!-- Empty state -->
+  <div x-show="!loading && timeline.length === 0" class="bg-white rounded-2xl border border-cream-200 p-12 text-center">
+    <div class="text-4xl mb-3">🌱</div>
+    <div class="text-ink-900 font-medium">还没有记忆</div>
+    <div class="mt-1 text-sm text-ink-500">Agent 产生的记忆会自动出现在这里。</div>
+  </div>
+
+  <!-- Day groups -->
+  <div class="space-y-10">
+    <template x-for="group in groupedTimeline" :key="group.key">
+      <div>
+        <div class="day-divider flex items-center my-6 text-xs text-ink-500 uppercase tracking-widest">
+          <span x-text="group.label + ' · ' + group.items.length + ' 条'"></span>
+        </div>
+        <div class="tl-spine space-y-5">
+          <template x-for="item in group.items" :key="item.id">
+            <article
+              :id="'mem-' + item.id"
+              :class="'tl-node target-' + item.target"
+              class="bg-white rounded-xl border border-cream-200 shadow-card hover:shadow-cardHover transition p-6 group">
+              <div class="flex items-center gap-2 mb-3">
+                <span class="pill" :class="item.target === 'user' ? 'pill-user' : 'pill-memory'" x-text="targetLabel(item.target)"></span>
+                <span class="text-[11px] text-ink-500 font-mono" x-text="fmtTime(item.created_at)"></span>
+                <span x-show="item.agent_id" class="ml-auto text-[10px] font-mono px-1.5 py-0.5 bg-cream-100 text-ink-500 rounded" x-text="item.agent_id"></span>
+              </div>
+              <div
+                class="hippo-body whitespace-pre-wrap break-words"
+                :class="!expanded[item.id] && item.content.length > 280 ? 'content-fade' : ''"
+                x-html="highlight(item.content, committedQuery)"></div>
+              <div class="mt-4 flex items-center justify-between text-xs">
+                <button
+                  x-show="item.content.length > 280"
+                  @click="expanded[item.id] = !expanded[item.id]"
+                  class="text-accent-600 hover:text-accent-700 font-medium"
+                  x-text="expanded[item.id] ? '收起 ↑' : '展开全文 ↓'"></button>
+                <div class="ml-auto flex items-center gap-3 opacity-0 group-hover:opacity-100 transition">
+                  <button @click="copy(item.content)" class="text-ink-500 hover:text-ink-900">复制</button>
+                  <button @click="askDelete(item)" class="text-rose-500 hover:text-rose-700">删除</button>
+                </div>
+              </div>
+            </article>
+          </template>
+        </div>
+      </div>
+    </template>
+  </div>
+
+  <!-- Sentinel for lazy load -->
+  <div id="loadmore-sentinel" class="py-10 text-center text-xs text-ink-500">
+    <template x-if="loading"><span>加载中…</span></template>
+    <template x-if="!loading && hasMore"><span>下拉继续加载</span></template>
+    <template x-if="!loading && !hasMore && timeline.length > 0"><span class="text-ink-400">— 到底了 —</span></template>
+  </div>
+</section>
+
 </main>
 
+<!-- ═══════════ DELETE CONFIRM MODAL ═══════════ -->
+<div x-show="deleteTarget" x-transition.opacity class="fixed inset-0 z-50 backdrop flex items-center justify-center p-4" @click.self="deleteTarget=null" @keydown.escape.window="deleteTarget=null">
+  <div x-show="deleteTarget" x-transition class="bg-white rounded-2xl shadow-cardHover max-w-md w-full p-6">
+    <div class="flex items-start gap-3">
+      <div class="w-10 h-10 rounded-full bg-rose-50 flex items-center justify-center shrink-0">
+        <svg class="w-5 h-5 text-rose-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M4.93 19h14.14c1.54 0 2.5-1.67 1.73-3L13.73 4a2 2 0 00-3.46 0L3.2 16c-.77 1.33.19 3 1.73 3z"/></svg>
+      </div>
+      <div class="flex-1">
+        <div class="font-medium text-ink-900">确定删除这条记忆？</div>
+        <div class="mt-1 text-sm text-ink-500">此操作不可撤销。</div>
+        <div class="mt-3 p-3 bg-cream-100 rounded-lg text-xs text-ink-700 max-h-32 overflow-y-auto whitespace-pre-wrap" x-text="deleteTarget?.content?.slice(0, 240) + (deleteTarget?.content?.length > 240 ? '…' : '')"></div>
+      </div>
+    </div>
+    <div class="mt-5 flex justify-end gap-2">
+      <button @click="deleteTarget=null" class="px-4 py-2 text-sm text-ink-700 hover:bg-cream-100 rounded-lg">取消</button>
+      <button @click="confirmDelete()" class="px-4 py-2 text-sm bg-rose-600 hover:bg-rose-700 text-white rounded-lg">确认删除</button>
+    </div>
+  </div>
+</div>
+
 <script>
-function hippoApp() {
+function hippo() {
   return {
-    // State
-    version: 'v0.3.0',
+    // ──────── state ────────
+    overview: { total: 0, by_target: [], by_agent: [], daily_counts_30d: [] },
+    timeline: [],
+    timelineTotal: 0,
+    hasMore: true,
     loading: false,
+    limit: 50,
+    expanded: {},
+    filter: { agent_id: null, target: null },
+
+    // search
+    query: '',
+    suggestions: [],
+    showSuggest: false,
+    searchMode: false,
+    committedQuery: '',
+    searchHits: [],
+    searchCursor: 0,
+
+    // ui misc
     notice: '', noticeType: 'ok',
-    stats: {},
-    items: [],            // all memories merged
-    selected: null,
-    searchQuery: '',
-    activeTag: '',
-    tags: [],
-    activity: new Array(30).fill(0),
-    activityLabels: [],
+    deleteTarget: null,
+    chart: null,
 
-    // Computed
-    get totalCount() { return this.items.length },
-    get memCount() { return this.items.filter(x => x.target === 'memory').length },
-    get userCount() { return this.items.filter(x => x.target === 'user').length },
-    get memUsagePct() {
-      const u = this.stats.hot_memory_usage; if (!u) return 0;
-      const [a, b] = u.split('/').map(Number); return Math.min(100, a/b*100);
+    // ──────── computed-ish ────────
+    get spark_max() {
+      const arr = this.overview.daily_counts_30d || [];
+      return Math.max(1, ...arr.map(d => d.count));
     },
-    get userUsagePct() {
-      const u = this.stats.hot_user_usage; if (!u) return 0;
-      const [a, b] = u.split('/').map(Number); return Math.min(100, a/b*100);
+    get recent30Total() {
+      return (this.overview.daily_counts_30d || []).reduce((s, d) => s + d.count, 0);
     },
-    get activityMax() { return Math.max(...this.activity, 1) },
-    get activitySum() { return this.activity.reduce((a,b)=>a+b, 0) },
-    get filteredItems() {
-      let xs = this.items;
-      if (this.activeTag) {
-        const t = this.activeTag.toLowerCase();
-        xs = xs.filter(x => x.content.toLowerCase().includes(t));
+    get recent30Peak() {
+      const arr = this.overview.daily_counts_30d || [];
+      if (!arr.length) return '';
+      let peak = arr[0];
+      for (const d of arr) if (d.count > peak.count) peak = d;
+      if (peak.count === 0) return '';
+      return peak.date.slice(5) + ' (' + peak.count + ')';
+    },
+    get groupedTimeline() {
+      const now = new Date();
+      const today = now.toISOString().slice(0,10);
+      const yest = new Date(now.getTime() - 86400000).toISOString().slice(0,10);
+      const groups = {};
+      for (const it of this.timeline) {
+        const d = new Date(it.created_at * 1000).toISOString().slice(0,10);
+        if (!groups[d]) groups[d] = [];
+        groups[d].push(it);
       }
-      return xs;  // search done server-side; tag filter client-side
+      return Object.keys(groups).sort((a,b) => b.localeCompare(a)).map(k => ({
+        key: k,
+        label: (k === today ? '今天' : k === yest ? '昨天' : k) + ' · ' + k.slice(5),
+        items: groups[k],
+      }));
     },
 
-    // Init
+    // ──────── init ────────
     async init() {
-      await this.reload();
+      window.addEventListener('keydown', (e) => {
+        if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+          e.preventDefault();
+          document.querySelector('input[type=search]').focus();
+        }
+      });
+      await this.loadOverview();
+      await this.loadTimeline(true);
+      this.setupLazyLoad();
     },
 
-    // API
-    async api(method, path, body) {
-      const opts = { method, headers: {} };
-      if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
-      const res = await fetch(path, opts);
-      if (!res.ok) {
-        const txt = await res.text();
-        throw new Error(`${res.status} ${txt.slice(0, 200)}`);
-      }
-      return res.json();
+    async loadOverview() {
+      try {
+        const r = await fetch('/v1/overview').then(r => r.json());
+        this.overview = r.data;
+        this.$nextTick(() => this.renderChart());
+      } catch (e) { this.notify('加载概览失败', 'err'); }
     },
 
-    async reload() {
+    async loadTimeline(reset = false) {
+      if (this.loading) return;
+      if (reset) { this.timeline = []; this.hasMore = true; }
+      if (!this.hasMore) return;
       this.loading = true;
       try {
-        // stats
-        this.stats = (await this.api('GET', '/v1/stats')).data;
-        this.version = 'v' + (this.stats.version || '0.3.0') + ' · ' +
-                       `${this.stats.hot_memory_count + this.stats.hot_user_count} hot / ${this.stats.cold_count} cold / ${this.stats.vec_count} vec`;
-        // load items
-        if (this.searchQuery.trim()) {
-          await this.doSearch();
-        } else {
-          await this.loadAll();
+        const params = new URLSearchParams({ limit: this.limit, offset: this.timeline.length });
+        if (this.filter.agent_id) params.set('agent_id', this.filter.agent_id);
+        if (this.filter.target) params.set('target', this.filter.target);
+        const r = await fetch('/v1/memories/all?' + params.toString()).then(r => r.json());
+        this.timeline.push(...r.data.items);
+        this.timelineTotal = r.data.total;
+        this.hasMore = r.data.has_more;
+      } catch (e) { this.notify('加载时间轴失败', 'err'); }
+      this.loading = false;
+    },
+
+    setupLazyLoad() {
+      const sentinel = document.getElementById('loadmore-sentinel');
+      if (!sentinel) return;
+      const io = new IntersectionObserver((entries) => {
+        if (entries[0].isIntersecting && !this.loading && this.hasMore) {
+          this.loadTimeline(false);
         }
-        // dashboard derive
-        this.computeActivity();
-        this.computeTags();
-      } catch (e) {
-        this.notify(e.message, 'err');
-      } finally {
-        this.loading = false;
-      }
+      }, { rootMargin: '400px' });
+      io.observe(sentinel);
     },
 
-    async loadAll() {
-      // Hot (returns {memory:[], user:[]})
-      const hotResp = (await this.api('GET', '/v1/memories/hot')).data;
-      let items = [];
-      if (Array.isArray(hotResp)) {
-        items = hotResp.slice();
-      } else {
-        ['memory', 'user'].forEach(t => (hotResp[t] || []).forEach(x => items.push({ ...x, target: x.target || t })));
-      }
-      // Cold timeline
-      const cold = (await this.api('GET', '/v1/memories/timeline?limit=500')).data || [];
-      items = items.concat(cold);
-      // dedupe by id, sort desc
-      const seen = new Set();
-      this.items = items.filter(x => !seen.has(x.id) && seen.add(x.id))
-                        .sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
-    },
-
-    async doSearch() {
-      const r = await this.api('POST', '/v1/memories/search', {
-        query: this.searchQuery, mode: 'hybrid', limit: 100,
+    renderChart() {
+      const el = document.getElementById('agentChart');
+      if (!el || !window.Chart) return;
+      if (this.chart) this.chart.destroy();
+      const data = this.overview.by_agent || [];
+      this.chart = new Chart(el, {
+        type: 'doughnut',
+        data: {
+          labels: data.map(a => a.label),
+          datasets: [{
+            data: data.map(a => a.count),
+            backgroundColor: data.map((_, i) => this.agentColor(i)),
+            borderWidth: 0,
+            hoverOffset: 4,
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: true,
+          cutout: '72%',
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              backgroundColor: '#1a1a1a',
+              padding: 10,
+              titleFont: { size: 11 },
+              bodyFont: { size: 12 },
+              displayColors: false,
+              callbacks: {
+                label: (ctx) => ctx.parsed + ' 条',
+              }
+            }
+          }
+        }
       });
-      const d = r.data;
-      const items = [];
-      (d.hot || []).forEach(x => items.push(x));
-      (d.cold || []).forEach(x => items.push(x));
-      const seen = new Set();
-      this.items = items.filter(x => !seen.has(x.id) && seen.add(x.id))
-                        .sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
     },
 
-    applyFilter() { /* purely client-side, computed handles it */ },
-
-    select(item) { this.selected = item },
-
-    async remove(item) {
-      if (!confirm(`确认删除这条 ${item.target} 记忆？\n\n${item.content.slice(0, 100)}…`)) return;
+    // ──────── search ────────
+    async doSuggest() {
+      if (this.query.length < 2) { this.suggestions = []; this.showSuggest = false; return; }
       try {
-        await this.api('POST', '/v1/memories/remove', { id: item.id, target: item.target });
-        this.notify('已删除');
-        this.selected = null;
-        await this.reload();
-      } catch (e) { this.notify(e.message, 'err'); }
+        const r = await fetch('/v1/memories/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: this.query, limit: 10 })
+        }).then(r => r.json());
+        const data = r.data || {};
+        const items = [...(data.hot || []), ...(data.cold || [])];
+        // dedupe by id, preserve order
+        const seen = new Set();
+        this.suggestions = items.filter(x => !seen.has(x.id) && seen.add(x.id)).slice(0, 10);
+        this.showSuggest = true;
+      } catch (e) { this.suggestions = []; }
     },
 
+    async commitSearch() {
+      if (this.query.length < 2) return;
+      // Fetch all matching ids, build cursor list, load timeline ensuring first hit is visible
+      await this.doSuggest();
+      if (!this.suggestions.length) { this.notify('未找到匹配记忆', 'err'); return; }
+      this.committedQuery = this.query;
+      this.searchMode = true;
+      this.showSuggest = false;
+      this.searchHits = this.suggestions.map(s => s.id);
+      this.searchCursor = 0;
+      await this.ensureLoadedAndFlyTo(this.searchHits[0]);
+    },
+
+    async navSearch(delta) {
+      if (!this.searchHits.length) return;
+      this.searchCursor = (this.searchCursor + delta + this.searchHits.length) % this.searchHits.length;
+      await this.ensureLoadedAndFlyTo(this.searchHits[this.searchCursor]);
+    },
+
+    clearSearch() {
+      this.query = '';
+      this.committedQuery = '';
+      this.searchMode = false;
+      this.searchHits = [];
+      this.searchCursor = 0;
+      this.suggestions = [];
+      this.showSuggest = false;
+    },
+
+    async jumpTo(id) {
+      this.committedQuery = this.query;
+      this.searchMode = true;
+      this.searchHits = this.suggestions.map(s => s.id);
+      this.searchCursor = Math.max(0, this.searchHits.indexOf(id));
+      this.showSuggest = false;
+      await this.ensureLoadedAndFlyTo(id);
+    },
+
+    async ensureLoadedAndFlyTo(id) {
+      // Keep loading pages until target id is in timeline, then scroll to it
+      let tries = 0;
+      while (!this.timeline.find(it => it.id === id) && this.hasMore && tries < 20) {
+        await this.loadTimeline(false);
+        tries++;
+      }
+      this.$nextTick(() => {
+        const el = document.getElementById('mem-' + id);
+        if (!el) { this.notify('这条记忆可能已不在当前时间轴', 'err'); return; }
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        el.classList.remove('flash');
+        void el.offsetWidth;
+        el.classList.add('flash');
+      });
+    },
+
+    // ──────── filters / scroll ────────
+    async setAgentFilter(agentKey) {
+      this.filter.agent_id = agentKey;
+      await this.loadTimeline(true);
+    },
+    scrollTimelineTop() {
+      document.getElementById('timeline-root').scrollIntoView({ behavior: 'smooth' });
+    },
+    async scrollToDate(dateStr) {
+      // load until we hit a card whose date matches
+      let tries = 0;
+      while (tries < 20) {
+        const target = this.timeline.find(it => new Date(it.created_at * 1000).toISOString().slice(0,10) === dateStr);
+        if (target) {
+          this.$nextTick(() => {
+            const el = document.getElementById('mem-' + target.id);
+            if (el) {
+              el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
+            }
+          });
+          return;
+        }
+        if (!this.hasMore) break;
+        await this.loadTimeline(false);
+        tries++;
+      }
+      this.notify('该日期没有记忆', 'err');
+    },
+
+    // ──────── CRUD ────────
+    askDelete(item) { this.deleteTarget = item; },
+    async confirmDelete() {
+      if (!this.deleteTarget) return;
+      const id = this.deleteTarget.id;
+      try {
+        const r = await fetch('/v1/memories/' + id, { method: 'DELETE' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        this.timeline = this.timeline.filter(it => it.id !== id);
+        this.deleteTarget = null;
+        this.notify('已删除', 'ok');
+        await this.loadOverview();
+      } catch (e) { this.notify('删除失败: ' + e.message, 'err'); }
+    },
     async exportAll() {
       try {
-        const r = await this.api('GET', '/v1/export');
-        const blob = new Blob([JSON.stringify(r.data || r, null, 2)], { type: 'application/json' });
+        const r = await fetch('/v1/export').then(r => r.json());
+        const blob = new Blob([JSON.stringify(r.data, null, 2)], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
-        const ts = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
-        a.href = url; a.download = `openhippo-export-${ts}.json`;
-        a.click();
-        URL.revokeObjectURL(url);
-        this.notify('导出完成');
-      } catch (e) { this.notify(e.message, 'err'); }
+        a.href = url; a.download = 'hippocampus-export-' + new Date().toISOString().slice(0,10) + '.json';
+        a.click(); URL.revokeObjectURL(url);
+        this.notify('导出完成', 'ok');
+      } catch (e) { this.notify('导出失败', 'err'); }
     },
+    copy(text) { navigator.clipboard.writeText(text); this.notify('已复制', 'ok'); },
 
-    // Activity (last 30 days)
-    computeActivity() {
-      const buckets = new Array(30).fill(0);
-      const labels = [];
-      const today = new Date(); today.setHours(0, 0, 0, 0);
-      for (let i = 29; i >= 0; i--) {
-        const d = new Date(today.getTime() - i * 86400000);
-        labels.push(`${d.getMonth()+1}/${d.getDate()}`);
-      }
-      this.items.forEach(x => {
-        const ts = (x.updated_at || x.created_at || 0) * 1000;
-        if (!ts) return;
-        const dayDiff = Math.floor((today.getTime() - ts) / 86400000);
-        if (dayDiff >= 0 && dayDiff < 30) buckets[29 - dayDiff]++;
-      });
-      this.activity = buckets;
-      this.activityLabels = labels;
-    },
-
-    // Tag extraction (frontend only — regex + word-freq)
-    computeTags() {
-      const counter = new Map();
-      const bump = (k) => { if (!k || k.length < 2) return; counter.set(k, (counter.get(k)||0)+1); };
-
-      // Curated stopwords (CN + EN)
-      const stop = new Set(['the','and','for','with','from','this','that','you','your','are','was','were','have','has','had','can','not','but','our','use','using','one','two','etc','via','per','also','will','make','made','more','than','then','only','need','any','all','其中','以及','一个','可以','使用','用于','需要','不是','或者','但是','已经','可能','应该','所以','如果','因为','现在','这个','那个','一些','一下','一直','非常','比较','发现','作为','根据','通过','对于','关于','虽然','然后','所有','它的','他的','她的','以及','出来','起来','下来','前面','后面']);
-
-      this.items.forEach(x => {
-        const c = x.content;
-        // 1. #hashtag style
-        (c.match(/#[\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\-_]{1,20}/g) || []).forEach(t => bump(t));
-        // 2. 【bracketed】
-        (c.match(/【([^】]{2,15})】/g) || []).forEach(m => bump(m.slice(1,-1)));
-        // 3. CamelCase / PascalCase tech terms (3+)
-        (c.match(/\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b/g) || []).forEach(t => bump(t));
-        // 4. UPPER_SNAKE / acronyms (2-8 caps)
-        (c.match(/\b[A-Z]{2,8}(?:_[A-Z0-9]+)*\b/g) || []).forEach(t => {
-          if (!['THE','AND','FOR','BUT','YOU','OK','PR','API','URL','UI','ID','OS'].includes(t)) bump(t);
-          else if (['API','UI','URL','PR','OS'].includes(t)) bump(t);  // keep these
-        });
-        // 5. backtick `code` segments
-        (c.match(/`([^`\n]{2,30})`/g) || []).forEach(m => bump(m.slice(1,-1)));
-        // 6. Chinese 2-3 char nouns via simple scan (项目名/工具名 in 《》 or quotes)
-        (c.match(/《([^》]{2,10})》/g) || []).forEach(m => bump(m.slice(1,-1)));
-        (c.match(/"([^"]{2,15})"/g) || []).forEach(m => bump(m.slice(1,-1)));
-        (c.match(/"([^"]{2,15})"/g) || []).forEach(m => bump(m.slice(1,-1)));
-      });
-
-      // Filter + sort
-      this.tags = Array.from(counter.entries())
-        .filter(([k, v]) => v >= 2 && !stop.has(k.toLowerCase()) && k.length <= 25)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 30)
-        .map(([name, count]) => ({ name, count }));
-    },
-
-    // Helpers
-    formatDate(ts) {
-      if (!ts) return '';
-      const d = new Date(ts * 1000); const now = new Date();
-      const diffH = (now - d) / 3600000;
-      if (diffH < 1) return Math.max(1, Math.floor(diffH * 60)) + '分钟前';
-      if (diffH < 24) return Math.floor(diffH) + '小时前';
-      if (diffH < 24*7) return Math.floor(diffH/24) + '天前';
-      return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-    },
-    formatDateFull(ts) {
-      if (!ts) return '';
-      const d = new Date(ts * 1000);
-      return d.toLocaleString('zh-CN', { hour12: false });
-    },
+    // ──────── helpers ────────
     notify(msg, type='ok') {
       this.notice = msg; this.noticeType = type;
-      setTimeout(() => this.notice = '', 2500);
+      setTimeout(() => { if (this.notice === msg) this.notice = ''; }, 2400);
+    },
+    targetLabel(t) { return t === 'user' ? '关于你' : '工作笔记'; },
+    targetColor(t) { return t === 'user' ? '#d97706' : '#059669'; },
+    agentColor(i) {
+      const palette = ['#7c6eea', '#d97706', '#059669', '#0284c7', '#db2777', '#65a30d', '#dc2626'];
+      return palette[i % palette.length];
+    },
+    fmtDate(ts) {
+      if (!ts) return '';
+      const d = new Date(ts * 1000);
+      return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+    },
+    fmtTime(ts) {
+      const d = new Date(ts * 1000);
+      return String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+    },
+    fmtRelative(ts) {
+      const delta = Date.now()/1000 - ts;
+      if (delta < 60) return '刚刚';
+      if (delta < 3600) return Math.floor(delta/60) + ' 分钟前';
+      if (delta < 86400) return Math.floor(delta/3600) + ' 小时前';
+      if (delta < 2592000) return Math.floor(delta/86400) + ' 天前';
+      return this.fmtDate(ts);
+    },
+    highlight(text, q) {
+      if (!text) return '';
+      let escaped = text.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+      // wrap code-ish tokens: `xxx`, paths ~/xxx or /xxx, versions vX.Y, inline flags like --foo, hex colors
+      escaped = escaped
+        .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+        .replace(/(^|[\s，。、（(])(~?\/[\w./~\-]{2,})/g, '$1<code>$2</code>')
+        .replace(/\b(v\d+\.\d+(?:\.\d+)?(?:\+\w+)?)\b/g, '<code>$1</code>')
+        .replace(/(#[0-9A-Fa-f]{6})\b/g, '<code>$1</code>');
+      if (!q || q.length < 2) return escaped;
+      const re = new RegExp('(' + q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
+      return escaped.replace(re, '<mark class="hippo-mark">$1</mark>');
     },
   };
 }
 </script>
+
 </body>
 </html>
