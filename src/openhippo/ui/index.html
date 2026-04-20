@@ -336,24 +336,33 @@
            x-show="calMaxCount > 1" x-text="'峰值 ' + calMaxCount"></div>
       <div class="overflow-x-auto pb-1 hippo-scrollbar" x-ref="calStrip">
         <div class="flex items-end gap-[3px] h-24 min-w-full pt-3">
-          <template x-for="(d, i) in calendar" :key="d.date">
+          <template x-for="(d, i) in visibleCalendar" :key="d.date">
             <button
               type="button"
               @click="onCalClick($event, d.date)"
               :title="d.date + ' · ' + d.count + ' 条'"
               :class="calBarClass(d)"
-              class="cal-bar relative flex-shrink-0 w-[10px] rounded-t-sm transition cursor-pointer border-b border-cream-200"
+              class="cal-bar relative flex-1 min-w-[6px] max-w-[28px] rounded-t-sm transition cursor-pointer border-b border-cream-200"
               :style="'height: ' + calBarHeight(d) + '%'">
             </button>
           </template>
         </div>
       </div>
-      <!-- month ruler -->
-      <div class="overflow-x-auto hippo-scrollbar mt-1" x-ref="calRuler">
+      <!-- date ruler — adaptive: shows day labels for short ranges, month labels for long ones -->
+      <div class="mt-1">
         <div class="flex gap-[3px] min-w-full text-[10px] text-ink-500 font-mono border-t border-cream-200 pt-1">
-          <template x-for="(d, i) in calendar" :key="'r-'+d.date">
-            <div class="w-[10px] flex-shrink-0 text-center relative">
-              <span x-show="d.date.endsWith('-01')"
+          <template x-for="(d, i) in visibleCalendar" :key="'r-'+d.date">
+            <div class="flex-1 min-w-[6px] max-w-[28px] text-center relative h-4">
+              <!-- short range (≤14 days): label every other day -->
+              <span x-show="visibleCalendar.length <= 14 && i % 2 === 0"
+                    class="absolute left-1/2 -translate-x-1/2 whitespace-nowrap text-ink-700"
+                    x-text="d.date.slice(5)"></span>
+              <!-- medium range (15–45): label every 5 days -->
+              <span x-show="visibleCalendar.length > 14 && visibleCalendar.length <= 45 && (i % 5 === 0 || i === visibleCalendar.length - 1)"
+                    class="absolute left-1/2 -translate-x-1/2 whitespace-nowrap text-ink-700"
+                    x-text="d.date.slice(5)"></span>
+              <!-- long range (>45): month markers -->
+              <span x-show="visibleCalendar.length > 45 && d.date.endsWith('-01')"
                     class="absolute left-1/2 -translate-x-1/2 whitespace-nowrap font-medium text-ink-700"
                     x-text="d.date.slice(0,4)+'/'+d.date.slice(5,7)"></span>
             </div>
@@ -366,16 +375,22 @@
   <!-- Empty state -->
   <div x-show="!loading && timeline.length === 0" class="bg-white rounded-2xl border border-cream-200 p-12 text-center">
     <div class="text-4xl mb-3">🌱</div>
-    <div class="text-ink-900 font-medium">还没有记忆</div>
-    <div class="mt-1 text-sm text-ink-500">Agent 产生的记忆会自动出现在这里。</div>
+    <div class="text-ink-900 font-medium" x-text="(dateRange.from || dateRange.to) ? '该时间段没有记录' : '还没有记忆'"></div>
+    <div class="mt-1 text-sm text-ink-500" x-text="(dateRange.from || dateRange.to) ? '试试切换到「全部」或更大的时间范围。' : 'Agent 产生的记忆会自动出现在这里。'"></div>
+    <button x-show="dateRange.from || dateRange.to" @click="applyDatePreset('all')"
+            class="mt-4 text-xs px-4 py-2 rounded-full bg-ink-900 text-white hover:bg-ink-700 transition">查看全部</button>
   </div>
 
   <!-- Day groups -->
   <div class="space-y-10">
     <template x-for="group in groupedTimeline" :key="group.key">
       <div>
-        <div class="day-divider flex items-center my-6 text-xs text-ink-500 uppercase tracking-widest">
-          <span x-text="group.label + ' · ' + group.items.length + ' 条'"></span>
+        <div class="day-divider flex items-center my-6">
+          <span class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-cream-100 border border-cream-300 text-xs font-medium text-ink-700">
+            <span class="w-1.5 h-1.5 rounded-full bg-accent-600"></span>
+            <span x-text="group.label"></span>
+            <span class="text-ink-500" x-text="'· ' + group.items.length + ' 条'"></span>
+          </span>
         </div>
         <div class="tl-spine space-y-5">
           <template x-for="item in group.items" :key="item.id">
@@ -495,6 +510,29 @@ function hippo() {
       for (const d of arr) if (d.count > peak.count) peak = d;
       if (peak.count === 0) return '';
       return peak.date.slice(5) + ' (' + peak.count + ')';
+    },
+    get visibleCalendar() {
+      // shrink the bar strip to match the current preset.
+      const key = this.datePreset;
+      const map = { 'today': 1, '7d': 7, '30d': 30, '90d': 90 };
+      if (key === 'all' || !key) {
+        // trim leading zeros — start at first day with data (or last 30 if all empty)
+        const firstNonZero = this.calendar.findIndex(d => d.count > 0);
+        if (firstNonZero < 0) return this.calendar.slice(-30);
+        return this.calendar.slice(firstNonZero);
+      }
+      const n = map[key] || 30;
+      return this.calendar.slice(-n);
+    },
+    get visibleCalendarPeak() {
+      let m = 0;
+      for (const d of this.visibleCalendar) if (d.count > m) m = d.count;
+      return m;
+    },
+    get visibleCalendarTotal() {
+      let s = 0;
+      for (const d of this.visibleCalendar) s += d.count;
+      return s;
     },
     get groupedTimeline() {
       const now = new Date();
@@ -700,7 +738,7 @@ function hippo() {
     },
     get calMaxCount() {
       let m = 1;
-      for (const d of this.calendar) if (d.count > m) m = d.count;
+      for (const d of this.visibleCalendar) if (d.count > m) m = d.count;
       return m;
     },
     calBarHeight(d) {
@@ -863,7 +901,13 @@ function hippo() {
     },
     fmtTime(ts) {
       const d = new Date(ts * 1000);
-      return String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+      const now = new Date();
+      const mm = String(d.getMonth()+1).padStart(2,'0');
+      const dd = String(d.getDate()).padStart(2,'0');
+      const hh = String(d.getHours()).padStart(2,'0');
+      const mi = String(d.getMinutes()).padStart(2,'0');
+      const yearPart = d.getFullYear() !== now.getFullYear() ? d.getFullYear() + '-' : '';
+      return yearPart + mm + '-' + dd + ' ' + hh + ':' + mi;
     },
     fmtRelative(ts) {
       const delta = Date.now()/1000 - ts;
