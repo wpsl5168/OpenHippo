@@ -296,6 +296,29 @@ class HippoEngine:
             self._embed_cold_entry(result["cold_id"])
         return result
 
+    def cold_add(self, target: str, content: str, source: str = "manual",
+                 tags: list[str] | None = None, metadata: dict | None = None,
+                 agent_id: str | None = None, scope: str = "agent",
+                 session_id: str | None = None, dedup: bool = True) -> dict:
+        """Insert directly into cold storage (e.g. session snapshots, audit records)
+        without going through hot. Auto-embeds for semantic search.
+
+        With dedup=True (default), returns existing entry on exact content match.
+        """
+        self._validate_target(target)
+        normalized = self._normalize_content(content)
+        if dedup:
+            existing = self.storage.cold_find_by_hash(target, normalized)
+            if existing:
+                return {"id": existing["id"], "status": "duplicate", "reason": "exact_cold"}
+        result = self.storage.cold_add(
+            target=target, content=content, source=source,
+            tags=tags, metadata=metadata,
+            agent_id=agent_id, scope=scope, session_id=session_id,
+        )
+        self._embed_cold_entry(result["id"])
+        return result
+
     def _embed_cold_entry(self, memory_id: str) -> bool:
         """Generate and store embedding for a cold memory entry. Returns success."""
         entry = self.storage.cold_get(memory_id)

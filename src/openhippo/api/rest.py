@@ -173,12 +173,35 @@ class ArchiveRequest(BaseModel):
 class PromoteRequest(BaseModel):
     memory_id: str = Field(..., description="Cold memory ID to promote")
 
+class ColdAddRequest(BaseModel):
+    target: str = Field("memory", description="'memory' or 'user'")
+    content: str = Field(..., description="Memory content")
+    source: str = Field("manual", description="e.g. 'manual', 'snapshot', 'session_start'")
+    tags: list[str] | None = None
+    metadata: dict | None = None
+    agent_id: str | None = None
+    session_id: str | None = None
+    scope: str = Field("agent", description="'agent' or 'shared'")
+    dedup: bool = Field(True, description="Skip if exact content already exists")
+
 
 # ── Endpoints ──
 
 @app.post("/v1/memories")
 def add_memory(req: AddRequest):
     return {"data": _engine().add(req.target, req.content, agent_id=req.agent_id, session_id=req.session_id, scope=req.scope)}
+
+@app.post("/v1/cold/memories")
+def cold_add_memory(req: ColdAddRequest):
+    """Insert directly into cold storage (snapshots, audit records, bulk imports).
+    Bypasses hot — auto-embeds for semantic search.
+    """
+    return {"data": _engine().cold_add(
+        target=req.target, content=req.content, source=req.source,
+        tags=req.tags, metadata=req.metadata,
+        agent_id=req.agent_id, session_id=req.session_id, scope=req.scope,
+        dedup=req.dedup,
+    )}
 
 @app.post("/v1/memories/search")
 def search_memories(req: SearchRequest):
