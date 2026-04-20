@@ -1,591 +1,419 @@
-<!doctype html>
-<html lang="zh">
+<!DOCTYPE html>
+<html lang="zh-CN">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>OpenHippo · 海马体审查台</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OpenHippo · 记忆面板</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
 <style>
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; }
-  .scroll-y { overflow-y: auto; }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
-  [x-cloak] { display: none !important; }
-  .badge { display:inline-block; padding:1px 6px; border-radius:4px; font-size:11px; font-weight:500; }
-  .pill { display:inline-block; padding:2px 8px; border-radius:9999px; font-size:11px; }
-  .chip { background:#eef2ff; color:#4338ca; }
-  .chip-warn { background:#fef3c7; color:#92400e; }
-  .chip-ok { background:#d1fae5; color:#065f46; }
-  .chip-err { background:#fee2e2; color:#991b1b; }
-  .chip-mute { background:#f3f4f6; color:#4b5563; }
+[x-cloak]{display:none!important}
+.bar{height:6px;background:#e2e8f0;border-radius:9999px;overflow:hidden}
+.bar>div{height:100%;background:linear-gradient(90deg,#6366f1,#a855f7);transition:width .4s}
+.tag{display:inline-block;padding:2px 10px;margin:3px;border-radius:9999px;background:#eef2ff;color:#4338ca;font-size:12px;cursor:pointer;transition:all .15s;border:1px solid transparent}
+.tag:hover{background:#6366f1;color:#fff}
+.tag.active{background:#4338ca;color:#fff;border-color:#312e81}
+.spark{display:flex;align-items:flex-end;gap:2px;height:48px}
+.spark>div{flex:1;background:linear-gradient(to top,#a855f7,#c4b5fd);border-radius:2px 2px 0 0;min-height:2px;transition:height .3s}
+.spark>div:hover{background:#6366f1}
+.scroll-thin::-webkit-scrollbar{width:6px}
+.scroll-thin::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:3px}
+.fade{animation:fade .3s}
+@keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 </style>
 </head>
 <body class="bg-slate-50 text-slate-900" x-data="hippoApp()" x-init="init()" x-cloak>
 
-<!-- Top bar -->
+<!-- Header -->
 <header class="bg-white border-b border-slate-200 sticky top-0 z-10">
-  <div class="px-4 py-2 flex items-center gap-3">
-    <div class="font-semibold text-lg">🧠 OpenHippo</div>
-    <span class="text-xs text-slate-500" x-text="`v${health?.version || '?'} · hot ${health?.metrics?.hot_entries ?? '-'} / cold ${health?.metrics?.cold_entries ?? '-'} / vec ${health?.metrics?.vec_entries ?? '-'}`"></span>
-    <div class="flex-1"></div>
-    <nav class="flex gap-1 text-sm">
-      <button @click="tab='browse'" :class="tab==='browse' ? 'bg-indigo-600 text-white' : 'text-slate-600 hover:bg-slate-100'" class="px-3 py-1 rounded">浏览</button>
-      <button @click="tab='dream'; loadDream()" :class="tab==='dream' ? 'bg-indigo-600 text-white' : 'text-slate-600 hover:bg-slate-100'" class="px-3 py-1 rounded">Dream</button>
-      <button @click="tab='logs'; loadLogs()" :class="tab==='logs' ? 'bg-indigo-600 text-white' : 'text-slate-600 hover:bg-slate-100'" class="px-3 py-1 rounded">日志</button>
-      <button @click="tab='settings'" :class="tab==='settings' ? 'bg-indigo-600 text-white' : 'text-slate-600 hover:bg-slate-100'" class="px-3 py-1 rounded">设置</button>
-    </nav>
+  <div class="max-w-7xl mx-auto px-4 py-3 flex items-center gap-3">
+    <div class="w-9 h-9 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-500 flex items-center justify-center text-white text-lg">🧠</div>
+    <div class="flex-1">
+      <h1 class="font-bold text-lg leading-none">OpenHippo</h1>
+      <div class="text-xs text-slate-500" x-text="version"></div>
+    </div>
+    <button @click="exportAll()" class="px-3 py-1.5 text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded-md flex items-center gap-1">
+      <span>⬇</span> 导出全部
+    </button>
+    <button @click="showSettings = !showSettings" class="px-2 py-1.5 text-slate-500 hover:text-slate-900" title="设置 Token">⚙</button>
   </div>
 </header>
 
-<main class="p-4 max-w-[1400px] mx-auto">
+<!-- Settings drawer -->
+<div x-show="showSettings" x-transition class="bg-amber-50 border-b border-amber-200">
+  <div class="max-w-7xl mx-auto px-4 py-3 flex items-center gap-2">
+    <label class="text-sm text-slate-700">Bearer Token:</label>
+    <input type="password" x-model="token" @blur="saveToken()" placeholder="粘贴 token 后失焦保存"
+           class="flex-1 px-2 py-1 text-sm border border-amber-300 rounded font-mono">
+    <button @click="reload()" class="px-3 py-1 text-sm bg-amber-600 text-white rounded">应用</button>
+  </div>
+</div>
 
-<!-- ───── BROWSE TAB ───── -->
-<section x-show="tab==='browse'" class="grid grid-cols-12 gap-4">
+<!-- Notify -->
+<div x-show="notice" x-transition class="fixed top-20 right-4 z-50 px-4 py-2 rounded-lg shadow-lg text-sm"
+     :class="noticeType==='err'?'bg-red-600 text-white':'bg-emerald-600 text-white'" x-text="notice"></div>
 
-  <!-- Left: filters + list -->
-  <div class="col-span-5 space-y-3">
-    <div class="bg-white rounded-lg border border-slate-200 p-3">
-      <div class="flex gap-2 mb-2">
-        <input type="text" x-model="searchQuery" @keyup.enter="doSearch()" placeholder="搜索 (回车) — 留空显示全部"
-               class="flex-1 px-3 py-1.5 border border-slate-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400">
-        <button @click="doSearch()" class="px-3 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700">搜</button>
+<main class="max-w-7xl mx-auto px-4 py-6 space-y-6">
+
+  <!-- Dashboard -->
+  <section class="grid grid-cols-2 md:grid-cols-4 gap-4">
+    <!-- Total -->
+    <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-100">
+      <div class="text-xs text-slate-500 mb-1">总记忆数</div>
+      <div class="text-3xl font-bold text-slate-900" x-text="totalCount"></div>
+      <div class="text-xs text-slate-400 mt-1">
+        <span class="text-indigo-600" x-text="memCount"></span> memory ·
+        <span class="text-purple-600" x-text="userCount"></span> user
       </div>
-      <div class="flex flex-wrap gap-2 text-xs">
-        <select x-model="targetFilter" @change="reload()" class="px-2 py-1 border border-slate-300 rounded">
-          <option value="">全部 target</option>
-          <option value="memory">memory</option>
-          <option value="user">user</option>
-        </select>
-        <select x-model="sourceFilter" @change="reload()" class="px-2 py-1 border border-slate-300 rounded">
-          <option value="all">Hot+Cold</option>
-          <option value="hot">仅 Hot</option>
-          <option value="cold">仅 Cold</option>
-        </select>
-        <select x-model="searchMode" class="px-2 py-1 border border-slate-300 rounded">
-          <option value="hybrid">hybrid (RRF)</option>
-          <option value="fts">FTS5</option>
-          <option value="vector">向量</option>
-        </select>
-        <label class="flex items-center gap-1"><input type="checkbox" x-model="showConsolidated">含 consolidated</label>
-        <label class="flex items-center gap-1"><input type="checkbox" x-model="showDormant">含 dormant</label>
+    </div>
+    <!-- Memory capacity -->
+    <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-100">
+      <div class="text-xs text-slate-500 mb-1">Memory 容量</div>
+      <div class="text-2xl font-semibold text-slate-900" x-text="stats.hot_memory_usage || '—'"></div>
+      <div class="bar mt-2"><div :style="`width:${memUsagePct}%`"></div></div>
+    </div>
+    <!-- User capacity -->
+    <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-100">
+      <div class="text-xs text-slate-500 mb-1">User 容量</div>
+      <div class="text-2xl font-semibold text-slate-900" x-text="stats.hot_user_usage || '—'"></div>
+      <div class="bar mt-2"><div :style="`width:${userUsagePct}%`"></div></div>
+    </div>
+    <!-- Vector / DB -->
+    <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-100">
+      <div class="text-xs text-slate-500 mb-1">向量 / DB</div>
+      <div class="text-2xl font-semibold text-slate-900">
+        <span x-text="stats.vec_count ?? 0"></span>
+        <span class="text-sm text-slate-400">vec</span>
+      </div>
+      <div class="text-xs text-slate-400 mt-1" x-text="`${(stats.db_size_kb||0).toLocaleString()} KB`"></div>
+    </div>
+  </section>
+
+  <!-- Activity + Tags -->
+  <section class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+    <!-- Activity sparkline -->
+    <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-100 lg:col-span-1">
+      <div class="text-sm font-semibold text-slate-700 mb-3">最近 30 天活跃 <span class="text-xs text-slate-400 font-normal" x-text="`(共 ${activitySum} 条)`"></span></div>
+      <div class="spark">
+        <template x-for="(c, i) in activity" :key="i">
+          <div :style="`height:${activityMax ? Math.max(2, c/activityMax*100) : 2}%`"
+               :title="`${activityLabels[i]}: ${c} 条`"></div>
+        </template>
+      </div>
+      <div class="flex justify-between text-[10px] text-slate-400 mt-1">
+        <span>30天前</span><span>今天</span>
       </div>
     </div>
 
-    <div class="bg-white rounded-lg border border-slate-200">
-      <div class="px-3 py-2 border-b border-slate-200 flex items-center justify-between text-sm">
-        <span><span class="font-medium" x-text="items.length"></span> 条 · <span class="text-slate-500" x-text="listMode"></span></span>
-        <button @click="reload()" class="text-indigo-600 hover:underline">刷新</button>
+    <!-- Tag cloud -->
+    <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-100 lg:col-span-2">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-sm font-semibold text-slate-700">话题标签 <span class="text-xs text-slate-400 font-normal">(从内容自动抽取)</span></div>
+        <button x-show="activeTag" @click="activeTag=''; applyFilter()" class="text-xs text-indigo-600 hover:underline">清除筛选</button>
       </div>
-      <div class="scroll-y" style="max-height: calc(100vh - 230px)">
-        <template x-for="m in filteredItems" :key="m.id">
-          <div @click="select(m)"
-               :class="selected?.id === m.id ? 'bg-indigo-50 border-l-2 border-indigo-500' : 'border-l-2 border-transparent hover:bg-slate-50'"
-               class="px-3 py-2 border-b border-slate-100 cursor-pointer">
+      <div x-show="tags.length" class="flex flex-wrap">
+        <template x-for="t in tags" :key="t.name">
+          <span class="tag" :class="activeTag===t.name?'active':''"
+                @click="activeTag = (activeTag===t.name?'':t.name); applyFilter()"
+                :style="`font-size:${10 + Math.min(8, t.count)}px`"
+                x-text="`${t.name} ${t.count}`"></span>
+        </template>
+      </div>
+      <div x-show="!tags.length" class="text-xs text-slate-400">暂无可识别标签</div>
+    </div>
+  </section>
+
+  <!-- Search + List + Detail -->
+  <section class="grid grid-cols-1 lg:grid-cols-5 gap-4">
+    <!-- List -->
+    <div class="lg:col-span-2 bg-white rounded-xl shadow-sm border border-slate-100 flex flex-col" style="max-height:70vh">
+      <div class="p-3 border-b border-slate-100 flex gap-2">
+        <input x-model="searchQuery" @keyup.enter="reload()" @input.debounce.500ms="reload()"
+               placeholder="搜索记忆… 留空显示全部"
+               class="flex-1 px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:border-indigo-500">
+        <button @click="reload()" class="px-3 py-2 text-sm bg-slate-100 hover:bg-slate-200 rounded-lg">↻</button>
+      </div>
+      <div class="px-3 py-2 text-xs text-slate-500 border-b border-slate-50 flex justify-between">
+        <span x-text="`${filteredItems.length} 条${activeTag?' · 标签 '+activeTag:''}${searchQuery?' · 搜索 '+searchQuery:''}`"></span>
+        <span class="text-slate-400" x-show="loading">加载中…</span>
+      </div>
+      <div class="overflow-y-auto scroll-thin flex-1">
+        <template x-for="item in filteredItems" :key="item.id">
+          <div @click="select(item)"
+               :class="selected?.id===item.id ? 'bg-indigo-50 border-l-4 border-l-indigo-500' : 'border-l-4 border-l-transparent hover:bg-slate-50'"
+               class="px-4 py-3 border-b border-slate-50 cursor-pointer fade">
             <div class="flex items-center gap-2 mb-1">
-              <span class="badge" :class="m.source === 'hot' ? 'chip-ok' : 'chip-mute'" x-text="m.source || (m.frequency != null ? 'cold' : 'hot')"></span>
-              <span class="badge chip" x-text="m.target"></span>
-              <template x-if="m.dream_status && m.dream_status !== 'active'">
-                <span class="badge" :class="m.dream_status === 'consolidated' ? 'chip-warn' : 'chip-err'" x-text="m.dream_status"></span>
-              </template>
-              <template x-if="m.score != null">
-                <span class="badge chip-mute mono" x-text="m.score.toFixed(3)"></span>
-              </template>
-              <span class="ml-auto text-xs text-slate-400 mono" x-text="(m.id || '').slice(0,8)"></span>
+              <span class="text-[10px] px-1.5 py-0.5 rounded font-medium"
+                    :class="item.target==='user'?'bg-purple-100 text-purple-700':'bg-indigo-100 text-indigo-700'"
+                    x-text="item.target"></span>
+              <span class="text-[10px] text-slate-400" x-text="formatDate(item.updated_at)"></span>
             </div>
-            <div class="text-sm text-slate-700 line-clamp-2" x-text="(m.content || '').slice(0, 200)"></div>
-            <div class="mt-1 flex flex-wrap gap-1 items-center text-xs text-slate-500">
-              <template x-for="t in (m.tags || [])"><span class="pill chip-mute" x-text="t"></span></template>
-              <template x-if="m.access_count != null"><span>· 访 <span x-text="m.access_count"></span></span></template>
-              <template x-if="m.created_at"><span>· <span x-text="fmtAge(m.created_at)"></span></span></template>
-            </div>
+            <div class="text-sm text-slate-700 line-clamp-2" x-text="item.content.slice(0, 120)"></div>
           </div>
         </template>
-        <template x-if="filteredItems.length === 0">
-          <div class="px-3 py-8 text-center text-sm text-slate-400">无匹配</div>
-        </template>
+        <div x-show="!loading && !filteredItems.length" class="p-8 text-center text-sm text-slate-400">
+          无匹配记忆
+        </div>
       </div>
     </div>
-  </div>
 
-  <!-- Right: detail -->
-  <div class="col-span-7">
-    <template x-if="!selected">
-      <div class="bg-white rounded-lg border border-slate-200 p-8 text-center text-slate-400">
-        点击左侧条目查看详情
-      </div>
-    </template>
-    <template x-if="selected">
-      <div class="bg-white rounded-lg border border-slate-200">
-        <div class="px-4 py-3 border-b border-slate-200 flex items-center gap-2">
-          <span class="badge" :class="selected.source === 'hot' ? 'chip-ok' : 'chip-mute'" x-text="selected.source || 'cold'"></span>
-          <span class="badge chip" x-text="selected.target"></span>
-          <template x-if="selected.dream_status && selected.dream_status !== 'active'">
-            <span class="badge" :class="selected.dream_status === 'consolidated' ? 'chip-warn' : 'chip-err'" x-text="selected.dream_status"></span>
-          </template>
-          <span class="mono text-xs text-slate-500 ml-2" x-text="selected.id"></span>
-          <button @click="copy(selected.id)" class="text-xs text-indigo-600 hover:underline">复制</button>
+    <!-- Detail -->
+    <div class="lg:col-span-3 bg-white rounded-xl shadow-sm border border-slate-100 p-5" style="min-height:300px">
+      <template x-if="!selected">
+        <div class="h-full flex items-center justify-center text-slate-400 text-sm">
+          ← 从左侧选择一条记忆查看详情
         </div>
-
-        <div class="p-4 space-y-4">
-          <div>
-            <label class="text-xs font-medium text-slate-500 uppercase tracking-wide">Content</label>
-            <textarea x-model="editContent" rows="10"
-                      class="mt-1 w-full px-3 py-2 border border-slate-300 rounded text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-400"></textarea>
-            <div class="mt-1 text-xs text-slate-400">
-              <span x-text="editContent.length"></span> chars
-              <template x-if="editContent !== (selected.content || '')">
-                <span class="text-amber-600">· 已修改</span>
-              </template>
-            </div>
+      </template>
+      <template x-if="selected">
+        <div class="fade">
+          <div class="flex items-center gap-2 mb-3 flex-wrap">
+            <span class="text-xs px-2 py-0.5 rounded font-medium"
+                  :class="selected.target==='user'?'bg-purple-100 text-purple-700':'bg-indigo-100 text-indigo-700'"
+                  x-text="selected.target"></span>
+            <span class="text-xs text-slate-500" x-text="`ID: ${selected.id}`"></span>
+            <span class="text-xs text-slate-400 ml-auto" x-text="formatDateFull(selected.updated_at)"></span>
           </div>
-
-          <div class="flex flex-wrap gap-2">
-            <button @click="saveEdit()" :disabled="editContent === (selected.content || '') || selected.source === 'hot'"
-                    class="px-3 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed">
-              💾 保存 (PUT)
+          <div class="bg-slate-50 rounded-lg p-4 text-sm text-slate-800 whitespace-pre-wrap font-sans leading-relaxed mb-4"
+               x-text="selected.content"></div>
+          <div class="flex items-center justify-between text-xs text-slate-500">
+            <div>
+              <span x-text="`${selected.content.length} 字`"></span>
+              <span x-show="selected.created_at !== selected.updated_at"> · 创建于 <span x-text="formatDate(selected.created_at)"></span></span>
+            </div>
+            <button @click="remove(selected)" class="px-3 py-1.5 text-sm bg-red-50 hover:bg-red-100 text-red-700 rounded-md">
+              删除此记忆
             </button>
-            <template x-if="selected.source === 'hot'">
-              <button @click="archive()" class="px-3 py-1.5 bg-amber-600 text-white text-sm rounded hover:bg-amber-700">归档到 cold</button>
-            </template>
-            <template x-if="selected.source !== 'hot'">
-              <button @click="promote()" class="px-3 py-1.5 bg-emerald-600 text-white text-sm rounded hover:bg-emerald-700">提升到 hot</button>
-            </template>
-            <template x-if="selected.dream_status && selected.dream_status !== 'active'">
-              <button @click="restore()" class="px-3 py-1.5 bg-sky-600 text-white text-sm rounded hover:bg-sky-700">↺ 恢复 (Dream restore)</button>
-            </template>
-            <button @click="del()" class="ml-auto px-3 py-1.5 bg-red-600 text-white text-sm rounded hover:bg-red-700">🗑 删除</button>
-          </div>
-
-          <div class="grid grid-cols-2 gap-3 text-sm pt-3 border-t border-slate-200">
-            <template x-for="(v, k) in metaFields(selected)" :key="k">
-              <div>
-                <div class="text-xs font-medium text-slate-500 uppercase tracking-wide" x-text="k"></div>
-                <div class="mono text-slate-700 break-all" x-text="v"></div>
-              </div>
-            </template>
           </div>
         </div>
-      </div>
-    </template>
-  </div>
-</section>
-
-<!-- ───── DREAM TAB ───── -->
-<section x-show="tab==='dream'" class="space-y-4">
-
-  <!-- Scheduler + metrics -->
-  <div class="bg-white rounded-lg border border-slate-200 p-4">
-    <div class="flex items-center mb-3">
-      <h2 class="font-semibold">F5 Dream — 自动整理调度器</h2>
-      <button @click="loadDream()" class="ml-auto text-sm text-indigo-600 hover:underline">刷新</button>
-    </div>
-    <template x-if="dreamMetrics">
-      <div class="grid grid-cols-4 gap-4 text-sm">
-        <div>
-          <div class="text-xs text-slate-500">自动调度</div>
-          <div class="font-semibold" :class="dreamMetrics.scheduler?.auto_enabled ? 'text-emerald-600' : 'text-slate-400'">
-            <span x-text="dreamMetrics.scheduler?.auto_enabled ? '✓ 启用' : '✗ 禁用'"></span>
-          </div>
-          <div class="text-xs text-slate-400 mt-0.5" x-text="`周期 ${(dreamMetrics.scheduler?.interval_seconds/3600).toFixed(1)}h`"></div>
-        </div>
-        <div>
-          <div class="text-xs text-slate-500">已执行</div>
-          <div class="font-semibold" x-text="`${dreamMetrics.scheduler?.iterations_succeeded}/${dreamMetrics.scheduler?.iterations_total}`"></div>
-          <div class="text-xs text-slate-400 mt-0.5" x-text="`下次 ${fmtTs(dreamMetrics.scheduler?.next_run_at)}`"></div>
-        </div>
-        <div>
-          <div class="text-xs text-slate-500">总整合 / 遗忘</div>
-          <div class="font-semibold" x-text="`${dreamMetrics.persistent?.totals?.consolidated || 0} / ${dreamMetrics.persistent?.totals?.forgotten || 0}`"></div>
-          <div class="text-xs text-slate-400 mt-0.5" x-text="`候选 ${dreamMetrics.persistent?.totals?.candidates || 0} · 簇 ${dreamMetrics.persistent?.totals?.clusters || 0}`"></div>
-        </div>
-        <div>
-          <div class="text-xs text-slate-500">最近一次</div>
-          <div class="font-semibold mono text-xs" x-text="dreamMetrics.persistent?.last_run?.status || 'n/a'"></div>
-          <div class="text-xs text-slate-400 mt-0.5" x-text="`${dreamMetrics.persistent?.last_run?.duration_ms || 0}ms`"></div>
-        </div>
-      </div>
-    </template>
-  </div>
-
-  <!-- Manual run -->
-  <div class="bg-white rounded-lg border border-slate-200 p-4">
-    <h2 class="font-semibold mb-3">手动触发</h2>
-    <div class="grid grid-cols-4 gap-3 text-sm mb-3">
-      <label>L2 阈值
-        <input type="number" step="0.05" min="0.1" max="2.0" x-model.number="dreamCfg.l2_threshold" class="mt-1 w-full px-2 py-1 border border-slate-300 rounded">
-      </label>
-      <label>最小簇大小
-        <input type="number" min="2" max="20" x-model.number="dreamCfg.min_cluster_size" class="mt-1 w-full px-2 py-1 border border-slate-300 rounded">
-      </label>
-      <label>Target
-        <select x-model="dreamCfg.target" class="mt-1 w-full px-2 py-1 border border-slate-300 rounded">
-          <option :value="null">全部</option>
-          <option value="memory">memory</option>
-          <option value="user">user</option>
-        </select>
-      </label>
-      <label class="flex items-center gap-2 self-end pb-1">
-        <input type="checkbox" x-model="dreamCfg.enable_forget"> 启用 forget (默认关)
-      </label>
-    </div>
-    <div class="flex gap-2">
-      <button @click="dreamPreview()" class="px-3 py-1.5 bg-slate-700 text-white text-sm rounded hover:bg-slate-800">👁 Preview (无副作用)</button>
-      <button @click="dreamRun()" class="px-3 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700">▶ 执行 (会修改)</button>
-    </div>
-    <template x-if="lastDreamResult">
-      <pre class="mt-3 p-3 bg-slate-50 border border-slate-200 rounded text-xs mono scroll-y" style="max-height: 200px" x-text="JSON.stringify(lastDreamResult, null, 2)"></pre>
-    </template>
-  </div>
-
-  <!-- Runs list -->
-  <div class="bg-white rounded-lg border border-slate-200">
-    <div class="px-4 py-3 border-b border-slate-200">
-      <h2 class="font-semibold">最近 Runs</h2>
-    </div>
-    <table class="w-full text-sm">
-      <thead class="bg-slate-50 text-xs text-slate-500 uppercase">
-        <tr>
-          <th class="px-3 py-2 text-left">ID</th>
-          <th class="px-3 py-2 text-left">状态</th>
-          <th class="px-3 py-2 text-right">候选</th>
-          <th class="px-3 py-2 text-right">簇</th>
-          <th class="px-3 py-2 text-right">整合</th>
-          <th class="px-3 py-2 text-right">遗忘</th>
-          <th class="px-3 py-2 text-right">耗时</th>
-          <th class="px-3 py-2 text-left">开始时间</th>
-        </tr>
-      </thead>
-      <tbody>
-        <template x-for="r in dreamRuns" :key="r.id">
-          <tr class="border-t border-slate-100 hover:bg-slate-50">
-            <td class="px-3 py-2 mono text-xs" x-text="r.id?.slice(0,8)"></td>
-            <td class="px-3 py-2">
-              <span class="badge" :class="r.status === 'completed' ? 'chip-ok' : (r.status === 'preview' ? 'chip' : 'chip-err')" x-text="r.status"></span>
-            </td>
-            <td class="px-3 py-2 text-right mono" x-text="r.candidates_count"></td>
-            <td class="px-3 py-2 text-right mono" x-text="r.clusters_count"></td>
-            <td class="px-3 py-2 text-right mono" x-text="r.consolidated_count"></td>
-            <td class="px-3 py-2 text-right mono" x-text="r.forgotten_count"></td>
-            <td class="px-3 py-2 text-right mono text-slate-500" x-text="r.duration_ms ? r.duration_ms+'ms' : '-'"></td>
-            <td class="px-3 py-2 text-xs text-slate-500" x-text="(r.started_at || '').replace('T',' ').slice(0,19)"></td>
-          </tr>
-        </template>
-        <template x-if="dreamRuns.length === 0">
-          <tr><td colspan="8" class="px-3 py-8 text-center text-slate-400">无</td></tr>
-        </template>
-      </tbody>
-    </table>
-  </div>
-</section>
-
-<!-- ───── LOGS TAB ───── -->
-<section x-show="tab==='logs'" class="bg-white rounded-lg border border-slate-200">
-  <div class="px-4 py-3 border-b border-slate-200 flex items-center">
-    <h2 class="font-semibold">操作日志</h2>
-    <button @click="loadLogs()" class="ml-auto text-sm text-indigo-600 hover:underline">刷新</button>
-  </div>
-  <table class="w-full text-sm">
-    <thead class="bg-slate-50 text-xs text-slate-500 uppercase">
-      <tr>
-        <th class="px-3 py-2 text-left">时间</th>
-        <th class="px-3 py-2 text-left">操作</th>
-        <th class="px-3 py-2 text-left">Target</th>
-        <th class="px-3 py-2 text-left">摘要</th>
-      </tr>
-    </thead>
-    <tbody>
-      <template x-for="(l, idx) in logs" :key="idx">
-        <tr class="border-t border-slate-100">
-          <td class="px-3 py-2 text-xs text-slate-500 mono" x-text="(l.timestamp || '').replace('T',' ').slice(0,19)"></td>
-          <td class="px-3 py-2"><span class="badge chip" x-text="l.action || l.op || '?'"></span></td>
-          <td class="px-3 py-2 text-xs" x-text="l.target || '-'"></td>
-          <td class="px-3 py-2 text-xs text-slate-600" x-text="(l.summary || l.content || JSON.stringify(l)).slice(0, 120)"></td>
-        </tr>
       </template>
-      <template x-if="logs.length === 0">
-        <tr><td colspan="4" class="px-3 py-8 text-center text-slate-400">无</td></tr>
-      </template>
-    </tbody>
-  </table>
-</section>
-
-<!-- ───── SETTINGS TAB ───── -->
-<section x-show="tab==='settings'" class="bg-white rounded-lg border border-slate-200 p-4 max-w-xl">
-  <h2 class="font-semibold mb-3">设置</h2>
-  <label class="block mb-3">
-    <div class="text-sm text-slate-700 mb-1">API Bearer Token (可选)</div>
-    <input type="password" x-model="token" @change="saveToken()"
-           placeholder="留空使用未鉴权模式"
-           class="w-full px-3 py-1.5 border border-slate-300 rounded text-sm mono focus:outline-none focus:ring-2 focus:ring-indigo-400">
-    <div class="text-xs text-slate-400 mt-1">存储在浏览器 localStorage，仅本机可见</div>
-  </label>
-  <label class="block mb-3">
-    <div class="text-sm text-slate-700 mb-1">API Base URL</div>
-    <input type="text" x-model="apiBase" @change="saveApiBase()"
-           class="w-full px-3 py-1.5 border border-slate-300 rounded text-sm mono">
-    <div class="text-xs text-slate-400 mt-1">默认与本页同源</div>
-  </label>
-  <div class="pt-3 border-t border-slate-200 mt-3">
-    <button @click="testConn()" class="px-3 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700">测试连接</button>
-    <span class="ml-2 text-sm" :class="testResult.startsWith('✓') ? 'text-emerald-600' : 'text-red-600'" x-text="testResult"></span>
-  </div>
-  <div class="pt-4 mt-4 border-t border-slate-200 text-xs text-slate-500">
-    <div>导出 / 导入入口：</div>
-    <div class="mt-2 flex flex-wrap gap-2">
-      <a :href="apiBase + '/v1/export?format=json'" target="_blank" class="text-indigo-600 hover:underline">下载 JSON</a>
-      <a :href="apiBase + '/v1/export?format=jsonl'" target="_blank" class="text-indigo-600 hover:underline">下载 JSONL</a>
-      <a :href="apiBase + '/v1/export?format=markdown'" target="_blank" class="text-indigo-600 hover:underline">下载 Markdown</a>
-      <a :href="apiBase + '/v1/export?format=csv'" target="_blank" class="text-indigo-600 hover:underline">下载 CSV</a>
     </div>
-  </div>
-</section>
+  </section>
 
-<!-- Toast -->
-<div x-show="toast.msg" x-transition
-     :class="toast.kind === 'err' ? 'bg-red-600' : 'bg-slate-800'"
-     class="fixed bottom-4 right-4 text-white text-sm px-4 py-2 rounded shadow-lg z-50" x-text="toast.msg"></div>
-
+  <footer class="text-center text-xs text-slate-400 py-4">
+    OpenHippo · Local-first AI memory engine ·
+    <a href="https://github.com/wpsl5168/OpenHippo" target="_blank" class="hover:underline">GitHub</a>
+  </footer>
 </main>
 
 <script>
 function hippoApp() {
   return {
-    // ── State
-    tab: 'browse',
-    apiBase: localStorage.getItem('hippo.apiBase') || '',
-    token: localStorage.getItem('hippo.token') || '',
-    health: null,
-    items: [],
-    listMode: '',
+    // State
+    version: 'v0.3.0',
+    token: localStorage.getItem('hippo_token') || '',
+    showSettings: false,
+    loading: false,
+    notice: '', noticeType: 'ok',
+    stats: {},
+    items: [],            // all memories merged
     selected: null,
-    editContent: '',
     searchQuery: '',
-    targetFilter: '',
-    sourceFilter: 'all',
-    searchMode: 'hybrid',
-    showConsolidated: false,
-    showDormant: false,
-    dreamMetrics: null,
-    dreamRuns: [],
-    dreamCfg: { l2_threshold: 0.55, min_cluster_size: 2, target: null, enable_forget: false },
-    lastDreamResult: null,
-    logs: [],
-    toast: { msg: '', kind: '' },
-    testResult: '',
+    activeTag: '',
+    tags: [],
+    activity: new Array(30).fill(0),
+    activityLabels: [],
 
-    // ── Init
-    async init() {
-      if (!this.apiBase) this.apiBase = window.location.origin;
-      try {
-        this.health = await this.api('GET', '/health');
-        await this.reload();
-      } catch (e) { this.notify('连接失败: ' + e.message, 'err'); }
+    // Computed
+    get totalCount() { return this.items.length },
+    get memCount() { return this.items.filter(x => x.target === 'memory').length },
+    get userCount() { return this.items.filter(x => x.target === 'user').length },
+    get memUsagePct() {
+      const u = this.stats.hot_memory_usage; if (!u) return 0;
+      const [a, b] = u.split('/').map(Number); return Math.min(100, a/b*100);
+    },
+    get userUsagePct() {
+      const u = this.stats.hot_user_usage; if (!u) return 0;
+      const [a, b] = u.split('/').map(Number); return Math.min(100, a/b*100);
+    },
+    get activityMax() { return Math.max(...this.activity, 1) },
+    get activitySum() { return this.activity.reduce((a,b)=>a+b, 0) },
+    get filteredItems() {
+      let xs = this.items;
+      if (this.activeTag) {
+        const t = this.activeTag.toLowerCase();
+        xs = xs.filter(x => x.content.toLowerCase().includes(t));
+      }
+      return xs;  // search done server-side; tag filter client-side
     },
 
-    // ── HTTP
+    // Init
+    async init() {
+      if (!this.token) this.showSettings = true;
+      await this.reload();
+    },
+    saveToken() { localStorage.setItem('hippo_token', this.token); this.notify('Token 已保存'); },
+
+    // API
     async api(method, path, body) {
-      const headers = { 'Content-Type': 'application/json' };
-      if (this.token) headers['Authorization'] = 'Bearer ' + this.token;
-      const res = await fetch(this.apiBase + path, {
-        method, headers,
-        body: body ? JSON.stringify(body) : undefined,
-      });
+      const opts = { method, headers: {} };
+      if (this.token) opts.headers['Authorization'] = 'Bearer ' + this.token;
+      if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+      const res = await fetch(path, opts);
       if (!res.ok) {
         const txt = await res.text();
         throw new Error(`${res.status} ${txt.slice(0, 200)}`);
       }
-      return await res.json();
+      return res.json();
     },
 
-    // ── Browse
     async reload() {
-      this.selected = null;
+      this.loading = true;
       try {
+        // stats
+        this.stats = (await this.api('GET', '/v1/stats')).data;
+        this.version = 'v' + (this.stats.version || '0.3.0') + ' · ' +
+                       `${this.stats.hot_memory_count + this.stats.hot_user_count} hot / ${this.stats.cold_count} cold / ${this.stats.vec_count} vec`;
+        // load items
         if (this.searchQuery.trim()) {
           await this.doSearch();
         } else {
           await this.loadAll();
         }
-      } catch (e) { this.notify(e.message, 'err'); }
+        // dashboard derive
+        this.computeActivity();
+        this.computeTags();
+      } catch (e) {
+        this.notify(e.message, 'err');
+      } finally {
+        this.loading = false;
+      }
     },
+
     async loadAll() {
-      // Hot list
-      const hot = (this.sourceFilter === 'cold') ? [] : (await this.api('GET', '/v1/memories/hot')).data;
-      let hotItems = [];
-      if (Array.isArray(hot)) {
-        hotItems = hot.map(x => ({ ...x, source: 'hot' }));
+      // Hot (returns {memory:[], user:[]})
+      const hotResp = (await this.api('GET', '/v1/memories/hot')).data;
+      let items = [];
+      if (Array.isArray(hotResp)) {
+        items = hotResp.slice();
       } else {
-        ['memory', 'user'].forEach(t => (hot[t] || []).forEach(x => hotItems.push({ ...x, source: 'hot', target: t })));
+        ['memory', 'user'].forEach(t => (hotResp[t] || []).forEach(x => items.push({ ...x, target: x.target || t })));
       }
       // Cold timeline
-      let cold = [];
-      if (this.sourceFilter !== 'hot') {
-        const tQ = this.targetFilter ? `?target=${this.targetFilter}&limit=200` : '?limit=200';
-        cold = (await this.api('GET', '/v1/memories/timeline' + tQ)).data || [];
-        cold = cold.map(x => ({ ...x, source: 'cold' }));
-      }
-      if (this.targetFilter) hotItems = hotItems.filter(x => x.target === this.targetFilter);
-      this.items = [...hotItems, ...cold];
-      this.listMode = 'browse';
+      const cold = (await this.api('GET', '/v1/memories/timeline?limit=500')).data || [];
+      items = items.concat(cold);
+      // dedupe by id, sort desc
+      const seen = new Set();
+      this.items = items.filter(x => !seen.has(x.id) && seen.add(x.id))
+                        .sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
     },
+
     async doSearch() {
-      if (!this.searchQuery.trim()) return this.loadAll();
       const r = await this.api('POST', '/v1/memories/search', {
-        query: this.searchQuery,
-        target: this.targetFilter || 'memory',
-        source: this.sourceFilter,
-        mode: this.searchMode,
-        limit: 50,
+        query: this.searchQuery, mode: 'hybrid', limit: 100,
       });
       const d = r.data;
       const items = [];
-      (d.hot || []).forEach(x => items.push({ ...x, source: 'hot' }));
-      (d.cold || []).forEach(x => items.push({ ...x, source: 'cold' }));
-      this.items = items;
-      this.listMode = `search · ${d.total || items.length} hits`;
+      (d.hot || []).forEach(x => items.push(x));
+      (d.cold || []).forEach(x => items.push(x));
+      const seen = new Set();
+      this.items = items.filter(x => !seen.has(x.id) && seen.add(x.id))
+                        .sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
     },
-    get filteredItems() {
-      return this.items.filter(m => {
-        const ds = m.dream_status;
-        if (!this.showConsolidated && ds === 'consolidated') return false;
-        if (!this.showDormant && ds === 'dormant') return false;
-        return true;
-      });
-    },
-    select(m) {
-      this.selected = m;
-      this.editContent = m.content || '';
-      // Lazy-load full record by ID for cold (timeline rows may be lean)
-      if (m.id && m.source === 'cold') {
-        this.api('GET', '/v1/memories/' + m.id).then(r => {
-          this.selected = r.data;
-          this.editContent = r.data.content || '';
-        }).catch(()=>{});
-      }
-    },
-    metaFields(m) {
-      const out = {};
-      ['target','agent_id','scope','importance','access_count','frequency','dream_status','consolidated_into','content_hash'].forEach(k => {
-        if (m[k] != null) out[k] = String(m[k]);
-      });
-      if (m.created_at) out.created_at = String(m.created_at);
-      if (m.updated_at) out.updated_at = String(m.updated_at);
-      if (m.merged_from) {
-        try { out.merged_from = JSON.stringify(typeof m.merged_from === 'string' ? JSON.parse(m.merged_from) : m.merged_from); }
-        catch { out.merged_from = String(m.merged_from); }
-      }
-      if (m.tags) out.tags = (Array.isArray(m.tags) ? m.tags : []).join(', ');
-      return out;
-    },
-    async saveEdit() {
-      if (!this.selected || this.selected.source === 'hot') return;
+
+    applyFilter() { /* purely client-side, computed handles it */ },
+
+    select(item) { this.selected = item },
+
+    async remove(item) {
+      if (!confirm(`确认删除这条 ${item.target} 记忆？\n\n${item.content.slice(0, 100)}…`)) return;
       try {
-        await this.api('PUT', '/v1/memories/' + this.selected.id, { content: this.editContent });
-        this.selected.content = this.editContent;
-        this.notify('✓ 已保存');
-        await this.reload();
-      } catch (e) { this.notify(e.message, 'err'); }
-    },
-    async del() {
-      if (!this.selected) return;
-      if (!confirm(`确定删除？\n${this.selected.id}\n${(this.selected.content||'').slice(0,80)}`)) return;
-      try {
-        if (this.selected.source === 'hot') {
-          await this.api('POST', '/v1/memories/remove', { target: this.selected.target, old_text: this.selected.content });
-        } else {
-          await this.api('DELETE', '/v1/memories/' + this.selected.id);
-        }
-        this.notify('✓ 已删除');
+        await this.api('POST', '/v1/memories/remove', { id: item.id, target: item.target });
+        this.notify('已删除');
         this.selected = null;
         await this.reload();
       } catch (e) { this.notify(e.message, 'err'); }
     },
-    async archive() {
+
+    async exportAll() {
       try {
-        await this.api('POST', '/v1/memories/archive', { target: this.selected.target, old_text: this.selected.content });
-        this.notify('✓ 已归档到 cold');
-        await this.reload();
-      } catch (e) { this.notify(e.message, 'err'); }
-    },
-    async promote() {
-      try {
-        await this.api('POST', '/v1/memories/promote', { memory_id: this.selected.id });
-        this.notify('✓ 已提升到 hot');
-        await this.reload();
-      } catch (e) { this.notify(e.message, 'err'); }
-    },
-    async restore() {
-      try {
-        await this.api('POST', '/v1/dream/restore/' + this.selected.id);
-        this.notify('✓ 已恢复');
-        await this.reload();
+        const r = await this.api('GET', '/v1/export');
+        const blob = new Blob([JSON.stringify(r.data || r, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        const ts = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+        a.href = url; a.download = `openhippo-export-${ts}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+        this.notify('导出完成');
       } catch (e) { this.notify(e.message, 'err'); }
     },
 
-    // ── Dream
-    async loadDream() {
-      try {
-        this.dreamMetrics = (await this.api('GET', '/v1/dream/metrics')).data;
-        this.dreamRuns = (await this.api('GET', '/v1/dream/runs?limit=20')).data || [];
-      } catch (e) { this.notify(e.message, 'err'); }
-    },
-    async dreamPreview() {
-      try {
-        const r = await this.api('POST', '/v1/dream/preview', this.dreamCfg);
-        this.lastDreamResult = r.data;
-        this.notify(`✓ Preview: ${r.data.clusters_count || 0} 簇`);
-        await this.loadDream();
-      } catch (e) { this.notify(e.message, 'err'); }
-    },
-    async dreamRun() {
-      if (!confirm('执行 Dream 会修改数据（可通过 restore 回滚）。继续？')) return;
-      try {
-        const r = await this.api('POST', '/v1/dream/run', this.dreamCfg);
-        this.lastDreamResult = r.data;
-        this.notify(`✓ 整合 ${r.data.consolidated_count || 0} 条`);
-        await this.loadDream();
-      } catch (e) { this.notify(e.message, 'err'); }
+    // Activity (last 30 days)
+    computeActivity() {
+      const buckets = new Array(30).fill(0);
+      const labels = [];
+      const today = new Date(); today.setHours(0, 0, 0, 0);
+      for (let i = 29; i >= 0; i--) {
+        const d = new Date(today.getTime() - i * 86400000);
+        labels.push(`${d.getMonth()+1}/${d.getDate()}`);
+      }
+      this.items.forEach(x => {
+        const ts = (x.updated_at || x.created_at || 0) * 1000;
+        if (!ts) return;
+        const dayDiff = Math.floor((today.getTime() - ts) / 86400000);
+        if (dayDiff >= 0 && dayDiff < 30) buckets[29 - dayDiff]++;
+      });
+      this.activity = buckets;
+      this.activityLabels = labels;
     },
 
-    // ── Logs
-    async loadLogs() {
-      try {
-        const r = await this.api('GET', '/v1/logs?limit=100');
-        this.logs = r.data || [];
-      } catch (e) { this.notify(e.message, 'err'); }
+    // Tag extraction (frontend only — regex + word-freq)
+    computeTags() {
+      const counter = new Map();
+      const bump = (k) => { if (!k || k.length < 2) return; counter.set(k, (counter.get(k)||0)+1); };
+
+      // Curated stopwords (CN + EN)
+      const stop = new Set(['the','and','for','with','from','this','that','you','your','are','was','were','have','has','had','can','not','but','our','use','using','one','two','etc','via','per','also','will','make','made','more','than','then','only','need','any','all','其中','以及','一个','可以','使用','用于','需要','不是','或者','但是','已经','可能','应该','所以','如果','因为','现在','这个','那个','一些','一下','一直','非常','比较','发现','作为','根据','通过','对于','关于','虽然','然后','所有','它的','他的','她的','以及','出来','起来','下来','前面','后面']);
+
+      this.items.forEach(x => {
+        const c = x.content;
+        // 1. #hashtag style
+        (c.match(/#[\w\u4e00-\u9fa5][\w\u4e00-\u9fa5\-_]{1,20}/g) || []).forEach(t => bump(t));
+        // 2. 【bracketed】
+        (c.match(/【([^】]{2,15})】/g) || []).forEach(m => bump(m.slice(1,-1)));
+        // 3. CamelCase / PascalCase tech terms (3+)
+        (c.match(/\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b/g) || []).forEach(t => bump(t));
+        // 4. UPPER_SNAKE / acronyms (2-8 caps)
+        (c.match(/\b[A-Z]{2,8}(?:_[A-Z0-9]+)*\b/g) || []).forEach(t => {
+          if (!['THE','AND','FOR','BUT','YOU','OK','PR','API','URL','UI','ID','OS'].includes(t)) bump(t);
+          else if (['API','UI','URL','PR','OS'].includes(t)) bump(t);  // keep these
+        });
+        // 5. backtick `code` segments
+        (c.match(/`([^`\n]{2,30})`/g) || []).forEach(m => bump(m.slice(1,-1)));
+        // 6. Chinese 2-3 char nouns via simple scan (项目名/工具名 in 《》 or quotes)
+        (c.match(/《([^》]{2,10})》/g) || []).forEach(m => bump(m.slice(1,-1)));
+        (c.match(/"([^"]{2,15})"/g) || []).forEach(m => bump(m.slice(1,-1)));
+        (c.match(/"([^"]{2,15})"/g) || []).forEach(m => bump(m.slice(1,-1)));
+      });
+
+      // Filter + sort
+      this.tags = Array.from(counter.entries())
+        .filter(([k, v]) => v >= 2 && !stop.has(k.toLowerCase()) && k.length <= 25)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 30)
+        .map(([name, count]) => ({ name, count }));
     },
 
-    // ── Settings
-    saveToken() { localStorage.setItem('hippo.token', this.token || ''); },
-    saveApiBase() { localStorage.setItem('hippo.apiBase', this.apiBase || ''); },
-    async testConn() {
-      try {
-        const h = await this.api('GET', '/health');
-        this.health = h;
-        this.testResult = `✓ 连通 v${h.version} hot=${h.metrics?.hot_entries} cold=${h.metrics?.cold_entries}`;
-      } catch (e) { this.testResult = '✗ ' + e.message; }
+    // Helpers
+    formatDate(ts) {
+      if (!ts) return '';
+      const d = new Date(ts * 1000); const now = new Date();
+      const diffH = (now - d) / 3600000;
+      if (diffH < 1) return Math.max(1, Math.floor(diffH * 60)) + '分钟前';
+      if (diffH < 24) return Math.floor(diffH) + '小时前';
+      if (diffH < 24*7) return Math.floor(diffH/24) + '天前';
+      return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
     },
-
-    // ── Utils
-    notify(msg, kind='ok') {
-      this.toast = { msg, kind };
-      setTimeout(() => { this.toast = { msg: '', kind: '' }; }, 3000);
+    formatDateFull(ts) {
+      if (!ts) return '';
+      const d = new Date(ts * 1000);
+      return d.toLocaleString('zh-CN', { hour12: false });
     },
-    copy(text) { navigator.clipboard?.writeText(text); this.notify('已复制'); },
-    fmtAge(iso) {
-      const t = typeof iso === 'string' ? new Date(iso).getTime() : iso * 1000;
-      const sec = (Date.now() - t) / 1000;
-      if (sec < 60) return '刚刚';
-      if (sec < 3600) return Math.floor(sec / 60) + '分钟前';
-      if (sec < 86400) return Math.floor(sec / 3600) + '小时前';
-      return Math.floor(sec / 86400) + '天前';
+    notify(msg, type='ok') {
+      this.notice = msg; this.noticeType = type;
+      setTimeout(() => this.notice = '', 2500);
     },
-    fmtTs(epoch) {
-      if (!epoch) return 'n/a';
-      const d = new Date(epoch * 1000);
-      return d.toISOString().replace('T',' ').slice(0, 19);
-    },
-  }
+  };
 }
 </script>
 </body>
