@@ -24,6 +24,22 @@ logger = logging.getLogger(__name__)
 engine: HippoEngine | None = None
 _dream_task: asyncio.Task | None = None
 
+# In-memory runtime counters for the auto-scheduler. Persistent run history
+# lives in dream_runs; these are process-local and complement that view.
+_dream_runtime: dict = {
+    "auto_enabled": False,
+    "interval_seconds": 0.0,
+    "started_at": None,
+    "iterations_total": 0,
+    "iterations_succeeded": 0,
+    "iterations_failed": 0,
+    "last_iteration_at": None,
+    "last_status": None,
+    "last_error": None,
+    "last_duration_ms": None,
+    "next_run_at": None,
+}
+
 
 async def _dream_autoloop(interval_seconds: float) -> None:
     """Background task: run consolidate() every `interval_seconds`.
@@ -32,24 +48,39 @@ async def _dream_autoloop(interval_seconds: float) -> None:
     Runs forget OFF by default — that's a manual decision per env config.
     Crashes are logged and the loop continues (we never want to silently die).
     """
+    import time as _time
     from ..core.dream import DreamConfig, DreamEngine
     # Initial delay so we don't slam the engine right at boot
     await asyncio.sleep(min(60.0, interval_seconds))
     while True:
+        _dream_runtime["next_run_at"] = None
+        iter_started = _time.time()
+        _dream_runtime["iterations_total"] += 1
         try:
             if engine is not None:
                 eng = DreamEngine(engine.storage)
                 cfg = DreamConfig(enable_forget=False)
                 # Run sync consolidate() in a worker thread so we don't block the loop
                 result = await asyncio.to_thread(eng.consolidate, cfg)
+                _dream_runtime["iterations_succeeded"] += 1
+                _dream_runtime["last_status"] = "completed"
+                _dream_runtime["last_error"] = None
+                _dream_runtime["last_duration_ms"] = result.duration_ms
                 logger.info(
                     "auto-dream completed: run=%s candidates=%d clusters=%d "
                     "consolidated=%d duration_ms=%d",
                     result.run_id, result.candidates_count, result.clusters_count,
                     result.consolidated_count, result.duration_ms,
                 )
-        except Exception:
+        except Exception as e:
+            _dream_runtime["iterations_failed"] += 1
+            _dream_runtime["last_status"] = "failed"
+            _dream_runtime["last_error"] = str(e)
+            _dream_runtime["last_duration_ms"] = int((_time.time() - iter_started) * 1000)
             logger.exception("auto-dream loop iteration failed; will retry next cycle")
+        finally:
+            _dream_runtime["last_iteration_at"] = _time.time()
+            _dream_runtime["next_run_at"] = _time.time() + interval_seconds
         try:
             await asyncio.sleep(interval_seconds)
         except asyncio.CancelledError:
@@ -66,7 +97,12 @@ async def lifespan(app: FastAPI):
     auto_enabled = os.environ.get("OPENHIPPO_DREAM_AUTO", "1").lower() not in {"0", "false", "no"}
     interval_hours = float(os.environ.get("OPENHIPPO_DREAM_INTERVAL_HOURS", "24"))
     if auto_enabled and interval_hours > 0:
-        _dream_task = asyncio.create_task(_dream_autoloop(interval_hours * 3600.0))
+        import time as _time
+        interval_seconds = interval_hours * 3600.0
+        _dream_runtime["auto_enabled"] = True
+        _dream_runtime["interval_seconds"] = interval_seconds
+        _dream_runtime["started_at"] = _time.time()
+        _dream_task = asyncio.create_task(_dream_autoloop(interval_seconds))
         logger.info("auto-dream scheduler started (every %sh)", interval_hours)
     try:
         yield
@@ -454,3 +490,21 @@ def dream_run_detail(run_id: str):
         ).fetchall()
     ]
     return {"data": {"run": dict(run_row), "actions": actions}}
+
+
+@app.get("/v1/dream/metrics")
+def dream_metrics():
+    """Observability snapshot for the F5 Dream subsystem.
+
+    Combines two sources:
+      * Persistent metrics from dream_runs (totals, last run, by-status aggregates)
+      * Process-local scheduler runtime (iterations, last_status, next_run_at)
+
+    Designed for both human inspection (jq) and machine scraping. Adding new
+    fields is safe; clients should treat unknown keys as forward-compat extras.
+    """
+    from ..core.dream import DreamEngine
+    eng = DreamEngine(_engine().storage)
+    persistent = eng.metrics()
+    runtime = dict(_dream_runtime)
+    return {"data": {"persistent": persistent, "scheduler": runtime}}

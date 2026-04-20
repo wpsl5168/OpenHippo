@@ -656,6 +656,74 @@ class DreamEngine:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    # ── Metrics ──
+    def metrics(self) -> dict:
+        """Aggregate health/observability metrics for the F5 Dream subsystem.
+
+        Pulls from dream_runs (durable history) so it survives process restarts.
+        Returned shape is intentionally flat for easy Prometheus/JSON scraping.
+        """
+        conn = self.storage._get_conn()
+        # SQLite stores timestamps as ISO-8601 strings; convert to epoch ms
+        # via julianday() arithmetic so we can aggregate durations.
+        # 86_400_000 ms/day; round to int.
+        dur_expr = (
+            "CAST((julianday(finished_at) - julianday(started_at)) * 86400000 "
+            "AS INTEGER)"
+        )
+
+        rows = conn.execute(
+            f"""SELECT status, COUNT(*) AS n,
+                       COALESCE(SUM(CASE WHEN finished_at IS NOT NULL THEN {dur_expr} END), 0) AS total_ms,
+                       COALESCE(AVG(CASE WHEN finished_at IS NOT NULL THEN {dur_expr} END), 0) AS avg_ms,
+                       COALESCE(MAX(CASE WHEN finished_at IS NOT NULL THEN {dur_expr} END), 0) AS max_ms
+                  FROM dream_runs
+                  GROUP BY status"""
+        ).fetchall()
+        by_status: dict[str, dict] = {}
+        total_runs = 0
+        for r in rows:
+            d = dict(r)
+            by_status[d["status"]] = {
+                "count": d["n"],
+                "total_ms": int(d["total_ms"] or 0),
+                "avg_ms": int(d["avg_ms"] or 0),
+                "max_ms": int(d["max_ms"] or 0),
+            }
+            total_runs += d["n"]
+
+        # Last run snapshot (any status)
+        last = conn.execute(
+            f"""SELECT id, started_at, finished_at, status, error,
+                       candidates_count, clusters_count,
+                       consolidated_count, forgotten_count,
+                       CASE WHEN finished_at IS NOT NULL THEN {dur_expr} END AS duration_ms
+                  FROM dream_runs ORDER BY started_at DESC LIMIT 1"""
+        ).fetchone()
+        last_dict = dict(last) if last else None
+
+        # Workload totals
+        totals = conn.execute(
+            """SELECT COALESCE(SUM(consolidated_count),0) AS consolidated,
+                      COALESCE(SUM(forgotten_count),0)    AS forgotten,
+                      COALESCE(SUM(candidates_count),0)   AS candidates,
+                      COALESCE(SUM(clusters_count),0)     AS clusters
+                 FROM dream_runs WHERE status='completed'"""
+        ).fetchone()
+
+        # Audit-trail size
+        action_total = conn.execute(
+            "SELECT COUNT(*) FROM dream_actions"
+        ).fetchone()[0]
+
+        return {
+            "total_runs": total_runs,
+            "by_status": by_status,
+            "last_run": last_dict,
+            "totals": dict(totals) if totals else {},
+            "actions_total": action_total,
+        }
+
 
 def _iso(ts: float) -> str:
     """ISO-8601 UTC string from epoch seconds."""
