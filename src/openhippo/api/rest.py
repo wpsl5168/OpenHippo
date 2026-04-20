@@ -184,7 +184,27 @@ def delete_memory(memory_id: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "0.3.0"}
+    """Liveness + lightweight metrics (F22 monitoring hooks)."""
+    from ..core.embedding import cache_stats
+    eng = _engine()
+    try:
+        conn = eng.storage._get_conn()
+        vec_size = conn.execute("SELECT COUNT(*) FROM cold_memory_vec").fetchone()[0]
+        cold_size = conn.execute("SELECT COUNT(*) FROM cold_memory").fetchone()[0]
+        hot_size = conn.execute("SELECT COUNT(*) FROM hot_memory").fetchone()[0]
+    except Exception as e:
+        return {"status": "degraded", "version": "0.3.0", "error": str(e)}
+    return {
+        "status": "ok",
+        "version": "0.3.0",
+        "metrics": {
+            "hot_entries": hot_size,
+            "cold_entries": cold_size,
+            "vec_entries": vec_size,
+            "embed_fail_count": getattr(type(eng), "_embed_fail_count", 0),
+            "embedding_cache": cache_stats(),
+        },
+    }
 
 
 @app.get("/v1/export")

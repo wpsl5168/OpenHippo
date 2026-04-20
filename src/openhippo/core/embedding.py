@@ -2,15 +2,69 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import threading
 import urllib.request
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 EMBEDDING_DIM = 768
+
+# ── LRU cache for embeddings (SHA-256 of normalized text → vector) ──
+# Avoids redundant Ollama calls for repeated content (very common in dedup checks
+# and re-imports). Default 1024 entries ≈ 6MB at 768 floats × 8 bytes.
+_CACHE_CAPACITY = 1024
+_cache: "OrderedDict[str, list[float]]" = OrderedDict()
+_cache_lock = threading.Lock()
+_cache_stats = {"hits": 0, "misses": 0}
+
+
+def _cache_key(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _cache_get(text: str) -> Optional[list[float]]:
+    key = _cache_key(text)
+    with _cache_lock:
+        if key in _cache:
+            _cache.move_to_end(key)
+            _cache_stats["hits"] += 1
+            return _cache[key]
+        _cache_stats["misses"] += 1
+        return None
+
+
+def _cache_put(text: str, vec: list[float]) -> None:
+    key = _cache_key(text)
+    with _cache_lock:
+        _cache[key] = vec
+        _cache.move_to_end(key)
+        while len(_cache) > _CACHE_CAPACITY:
+            _cache.popitem(last=False)
+
+
+def cache_stats() -> dict:
+    with _cache_lock:
+        total = _cache_stats["hits"] + _cache_stats["misses"]
+        return {
+            "size": len(_cache),
+            "capacity": _CACHE_CAPACITY,
+            "hits": _cache_stats["hits"],
+            "misses": _cache_stats["misses"],
+            "hit_rate": round(_cache_stats["hits"] / total, 3) if total else 0.0,
+        }
+
+
+def cache_clear() -> None:
+    with _cache_lock:
+        _cache.clear()
+        _cache_stats["hits"] = 0
+        _cache_stats["misses"] = 0
 
 
 class EmbeddingProvider(ABC):
@@ -193,13 +247,39 @@ def _create_default_provider() -> EmbeddingProvider:
 # ── Backward-compatible convenience functions ──
 
 def get_embedding(text: str) -> Optional[list[float]]:
-    """Get embedding vector. Uses the configured provider."""
-    return get_provider().embed(text)
+    """Get embedding vector with LRU cache. Uses the configured provider."""
+    if not text:
+        return None
+    cached = _cache_get(text)
+    if cached is not None:
+        return cached
+    vec = get_provider().embed(text)
+    if vec is not None:
+        _cache_put(text, vec)
+    return vec
 
 
 def get_embeddings_batch(texts: list[str]) -> list[Optional[list[float]]]:
-    """Get embeddings for multiple texts."""
-    return get_provider().embed_batch(texts)
+    """Get embeddings for multiple texts with LRU cache."""
+    results: list[Optional[list[float]]] = [None] * len(texts)
+    miss_idx: list[int] = []
+    miss_texts: list[str] = []
+    for i, t in enumerate(texts):
+        if not t:
+            continue
+        cached = _cache_get(t)
+        if cached is not None:
+            results[i] = cached
+        else:
+            miss_idx.append(i)
+            miss_texts.append(t)
+    if miss_texts:
+        fresh = get_provider().embed_batch(miss_texts)
+        for j, vec in zip(miss_idx, fresh):
+            results[j] = vec
+            if vec is not None:
+                _cache_put(texts[j], vec)
+    return results
 
 
 # ── Utility ──

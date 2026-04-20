@@ -19,6 +19,9 @@ class HippoEngine:
     # Hot memory capacity defaults (chars)
     HOT_MEMORY_LIMIT = 4400
     HOT_USER_LIMIT = 2750
+    # Hard cap on entry count regardless of chars (prevents pathological
+    # tiny-entry floods that bypass char-based eviction).
+    HOT_MAX_ENTRIES = 100
 
     def __init__(self, db_path: str | Path | None = None):
         if db_path is None:
@@ -109,9 +112,12 @@ class HippoEngine:
         result = self.storage.hot_add(target, content)
 
         # ── Auto-eviction: archive oldest entries when over capacity ──
+        # Dual constraint: by chars (context-window aware) AND by entry count
+        # (defense against many tiny entries).
         limit = self.HOT_MEMORY_LIMIT if target == "memory" else self.HOT_USER_LIMIT
         current_chars = self.storage.hot_chars(target)
-        if current_chars > limit:
+        current_count = len(self.storage.hot_list(target))
+        if current_chars > limit or current_count > self.HOT_MAX_ENTRIES:
             self._evict_hot(target, current_chars, limit)
 
         return result
@@ -144,12 +150,17 @@ class HippoEngine:
         return None
 
     def _evict_hot(self, target: str, current_chars: int, limit: int) -> None:
-        """Archive oldest hot entries until under capacity (with 10% headroom)."""
+        """Archive oldest hot entries until under capacity (with 10% headroom).
+
+        Stops when BOTH chars-budget AND entry-count are within target.
+        """
         target_chars = int(limit * 0.9)  # evict to 90% to avoid thrashing
+        target_entries = int(self.HOT_MAX_ENTRIES * 0.9)
         entries = self.storage.hot_list(target)  # sorted by sort_order, created_at
+        current_count = len(entries)
         evicted = 0
         for entry in entries:  # oldest first
-            if current_chars <= target_chars:
+            if current_chars <= target_chars and current_count <= target_entries:
                 break
             entry_len = len(entry["content"])
             # Archive to cold storage
@@ -165,6 +176,7 @@ class HippoEngine:
                     self._embed_cold_entry(cold_result["id"])
                     self.storage._log("evict", removed["id"], {"cold_id": cold_result["id"]})
                     current_chars -= entry_len
+                    current_count -= 1
                     evicted += 1
             except Exception as e:
                 logger.warning("Eviction failed for entry %s: %s", entry["id"], e)
