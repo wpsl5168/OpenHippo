@@ -179,7 +179,8 @@ class Storage:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def hot_add(self, target: str, content: str) -> dict:
+    def hot_add(self, target: str, content: str, agent_id: str | None = None,
+                session_id: str | None = None, scope: str = "agent") -> dict:
         conn = self._get_conn()
         mid = uuid.uuid4().hex[:16]
         now = time.time()
@@ -188,8 +189,8 @@ class Storage:
             (target,),
         ).fetchone()[0]
         conn.execute(
-            "INSERT INTO hot_memory (id, target, content, created_at, updated_at, sort_order) VALUES (?,?,?,?,?,?)",
-            (mid, target, content, now, now, max_order + 1),
+            "INSERT INTO hot_memory (id, target, content, created_at, updated_at, sort_order, agent_id, session_id, scope) VALUES (?,?,?,?,?,?,?,?,?)",
+            (mid, target, content, now, now, max_order + 1, agent_id, session_id, scope),
         )
         conn.commit()
         return {"id": mid, "status": "created"}

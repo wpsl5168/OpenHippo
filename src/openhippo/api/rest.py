@@ -146,6 +146,9 @@ def _engine() -> HippoEngine:
 class AddRequest(BaseModel):
     target: str = Field("memory", description="'memory' or 'user'")
     content: str = Field(..., description="Memory content")
+    agent_id: str | None = Field(None, description="Source agent identity")
+    session_id: str | None = Field(None, description="Source session id")
+    scope: str = Field("agent", description="'agent' or 'shared'")
 
 class ReplaceRequest(BaseModel):
     target: str = Field("memory")
@@ -175,7 +178,7 @@ class PromoteRequest(BaseModel):
 
 @app.post("/v1/memories")
 def add_memory(req: AddRequest):
-    return {"data": _engine().add(req.target, req.content)}
+    return {"data": _engine().add(req.target, req.content, agent_id=req.agent_id, session_id=req.session_id, scope=req.scope)}
 
 @app.post("/v1/memories/search")
 def search_memories(req: SearchRequest):

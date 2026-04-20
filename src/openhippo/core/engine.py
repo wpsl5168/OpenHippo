@@ -51,7 +51,8 @@ class HippoEngine:
     _embed_fail_count = 0
     EMBED_FAIL_WARN_THRESHOLD = 3
 
-    def add(self, target: str, content: str) -> dict:
+    def add(self, target: str, content: str, agent_id: str | None = None,
+            session_id: str | None = None, scope: str = "agent") -> dict:
         """Add a memory entry to hot storage with dedup.
 
         Dedup pipeline:
@@ -109,7 +110,7 @@ class HippoEngine:
                     HippoEngine._embed_fail_count,
                 )
 
-        result = self.storage.hot_add(target, content)
+        result = self.storage.hot_add(target, content, agent_id=agent_id, session_id=session_id, scope=scope)
 
         # ── Auto-eviction: archive oldest entries when over capacity ──
         # Dual constraint: by chars (context-window aware) AND by entry count
