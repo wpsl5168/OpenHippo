@@ -44,45 +44,44 @@ class HippoEngine:
                 s = s[len(prefix):]
         return s
 
+    # Track consecutive embedding failures for health monitoring
+    _embed_fail_count = 0
+    EMBED_FAIL_WARN_THRESHOLD = 3
+
     def add(self, target: str, content: str) -> dict:
         """Add a memory entry to hot storage with dedup.
 
         Dedup pipeline:
-        1. Exact match (SHA-256 of normalized content) → skip
-        2. Semantic match (cosine > 0.92 against cold) → skip
+        1. Exact match via content_hash index (hot + cold) → skip
+        2. Semantic match (L2 < 0.4 against cold OR hot) → skip
         3. Otherwise → create new entry
 
-        Returns:
-            {"id": str, "status": "created"/"duplicate"/"similar", ...}
+        Embedding failures are logged + counted; a warning is emitted on
+        consecutive failures so silent dedup degradation is visible.
         """
         self._validate_target(target)
         normalized = self._normalize_content(content)
 
-        # ── Exact dedup: check hot + cold ──
+        # ── Exact dedup: O(1) via content_hash index ──
         if self.EXACT_DEDUP:
             content_hash = hashlib.sha256(normalized.encode()).hexdigest()
-            # Check hot
+            # Check hot (small set, full scan is fine; ~tens of entries)
             for entry in self.storage.hot_list(target):
                 if hashlib.sha256(self._normalize_content(entry["content"]).encode()).hexdigest() == content_hash:
                     return {"id": entry["id"], "status": "duplicate", "reason": "exact_hot"}
-            # Check cold
-            conn = self.storage._get_conn()
-            # Use LIKE as fast pre-filter, then exact hash
-            rows = conn.execute(
-                "SELECT id, content FROM cold_memory WHERE target=?", (target,)
-            ).fetchall()
-            for row in rows:
-                if hashlib.sha256(self._normalize_content(row["content"]).encode()).hexdigest() == content_hash:
-                    return {"id": row["id"], "status": "duplicate", "reason": "exact_cold"}
+            # Check cold via indexed lookup
+            cold_dup = self.storage.cold_find_by_hash(target, content)
+            if cold_dup:
+                return {"id": cold_dup["id"], "status": "duplicate", "reason": "exact_cold"}
 
-        # ── Semantic dedup: check cold embeddings ──
+        # ── Semantic dedup: cold + hot ──
         vec = get_embedding(normalized)
         if vec:
+            HippoEngine._embed_fail_count = 0  # reset
             similar = self.storage.vec_search(vec, target, limit=1)
             if similar:
                 distance = similar[0].get("vec_distance", 999)
-                # sqlite-vec returns L2 distance; cosine similarity ≈ 1 - distance/2 for normalized vectors
-                # For nomic-embed-text (normalized), distance < 0.4 ≈ cosine > 0.92
+                # nomic-embed-text (normalized): L2 distance < 0.4 ≈ cosine > 0.92
                 if distance < 0.4:
                     return {
                         "id": similar[0]["id"],
@@ -90,6 +89,22 @@ class HippoEngine:
                         "reason": "semantic_cold",
                         "distance": round(distance, 4),
                     }
+            # Hot semantic dedup (opt-in: O(N) ollama calls per write).
+            # Disabled by default to honor F1 <50ms target. Enable via
+            # config.semantic_dedup_hot=true when accuracy > latency.
+            hot_match = None
+            if getattr(getattr(self, "config", None), "semantic_dedup_hot", False):
+                hot_match = self._semantic_match_hot(target, vec)
+            if hot_match:
+                return hot_match
+        else:
+            HippoEngine._embed_fail_count += 1
+            if HippoEngine._embed_fail_count >= self.EMBED_FAIL_WARN_THRESHOLD:
+                logger.warning(
+                    "Embedding backend has failed %d consecutive times — "
+                    "semantic dedup is currently DEGRADED. Check Ollama / SentenceTransformer.",
+                    HippoEngine._embed_fail_count,
+                )
 
         result = self.storage.hot_add(target, content)
 
@@ -100,6 +115,33 @@ class HippoEngine:
             self._evict_hot(target, current_chars, limit)
 
         return result
+
+    def _semantic_match_hot(self, target: str, query_vec: list[float],
+                            threshold: float = 0.4) -> dict | None:
+        """Check semantic similarity against hot entries (compute embeddings on-the-fly).
+
+        Hot is small (tens of entries), so on-demand embedding is acceptable.
+        Returns a duplicate-style dict if a near match is found, else None.
+        """
+        if not query_vec:
+            return None
+        # Cosine similarity between two unit vectors u, v: cos = sum(u_i * v_i)
+        # L2 distance d = sqrt(2 - 2*cos), so cos = 1 - d^2/2.
+        # Threshold 0.4 ≈ cos > 0.92.
+        for entry in self.storage.hot_list(target):
+            evec = get_embedding(self._normalize_content(entry["content"]))
+            if not evec or len(evec) != len(query_vec):
+                continue
+            cos = sum(a * b for a, b in zip(query_vec, evec))
+            d = (2.0 - 2.0 * cos) ** 0.5 if cos < 1 else 0.0
+            if d < threshold:
+                return {
+                    "id": entry["id"],
+                    "status": "similar",
+                    "reason": "semantic_hot",
+                    "distance": round(d, 4),
+                }
+        return None
 
     def _evict_hot(self, target: str, current_chars: int, limit: int) -> None:
         """Archive oldest hot entries until under capacity (with 10% headroom)."""

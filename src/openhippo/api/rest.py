@@ -2,21 +2,40 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..core.engine import HippoEngine
 
-app = FastAPI(
-    title="OpenHippo",
-    description="🦛 Local-first memory engine for AI Agents",
-    version="0.2.0",
-)
-
 # Auth middleware (loaded from config)
 from ..core.config import get_config, get as cfg_get
 from .auth import BearerAuthMiddleware
+
+
+# Global engine instance (initialized in lifespan)
+engine: HippoEngine | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global engine
+    engine = HippoEngine()
+    try:
+        yield
+    finally:
+        if engine:
+            engine.close()
+
+
+app = FastAPI(
+    title="OpenHippo",
+    description="🦛 Local-first memory engine for AI Agents",
+    version="0.3.0",
+    lifespan=lifespan,
+)
 
 _conf = get_config()
 app.add_middleware(
@@ -24,21 +43,6 @@ app.add_middleware(
     enabled=cfg_get(_conf, "auth.enabled", False),
     tokens=cfg_get(_conf, "auth.tokens", []),
 )
-
-# Global engine instance (initialized on startup)
-engine: HippoEngine | None = None
-
-
-@app.on_event("startup")
-def startup():
-    global engine
-    engine = HippoEngine()
-
-
-@app.on_event("shutdown")
-def shutdown():
-    if engine:
-        engine.close()
 
 
 def _engine() -> HippoEngine:
@@ -180,7 +184,7 @@ def delete_memory(memory_id: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "0.2.0"}
+    return {"status": "ok", "version": "0.3.0"}
 
 
 @app.get("/v1/export")
