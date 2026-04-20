@@ -291,3 +291,40 @@ def import_memories(req: ImportRequest):
     e = _engine()
     result = import_json(e.storage, req.data, reembed=req.reembed, dry_run=req.dry_run)
     return {"data": result}
+
+
+# ── F5 Dream — sleep-inspired consolidation ──
+
+class DreamPreviewRequest(BaseModel):
+    target: str | None = Field(None, description="Restrict to 'memory' or 'user'; None = all")
+    l2_threshold: float = Field(0.55, ge=0.1, le=2.0, description="L2 distance ceiling for clustering")
+    min_cluster_size: int = Field(2, ge=2, le=20)
+    max_candidates: int = Field(500, ge=1, le=5000)
+    knn_fetch: int = Field(20, ge=2, le=100)
+
+
+@app.post("/v1/dream/preview")
+def dream_preview(req: DreamPreviewRequest):
+    """Dry-run consolidation: cluster cold memories without mutating any data.
+
+    Records a 'preview' row in dream_runs for audit; clusters are returned in
+    the response. Use this before /v1/dream/run to verify what would be merged.
+    """
+    from ..core.dream import DreamConfig, DreamEngine
+    cfg = DreamConfig(
+        target=req.target,
+        l2_threshold=req.l2_threshold,
+        min_cluster_size=req.min_cluster_size,
+        max_candidates=req.max_candidates,
+        knn_fetch=req.knn_fetch,
+    )
+    eng = DreamEngine(_engine().storage)
+    return {"data": eng.preview(cfg).to_dict()}
+
+
+@app.get("/v1/dream/runs")
+def dream_runs_list(limit: int = 20):
+    """List recent dream cycles (preview + actual runs)."""
+    from ..core.dream import DreamEngine
+    eng = DreamEngine(_engine().storage)
+    return {"data": eng.list_runs(limit=limit)}
