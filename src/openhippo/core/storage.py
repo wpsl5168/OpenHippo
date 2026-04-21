@@ -141,6 +141,13 @@ class Storage:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=5000")
+        # Perf tuning: NORMAL is safe under WAL (loses at most last txn on power
+        # loss, never corrupts). 64MB cache + memory temp store keeps sorts and
+        # joins out of disk. mmap_size enables zero-copy reads on hot pages.
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=-65536")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA mmap_size=268435456")
         return conn
 
     def _get_conn(self) -> sqlite3.Connection:
