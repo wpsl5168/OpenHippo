@@ -181,6 +181,10 @@
         </div>
       </div>
     </div>
+    <button @click="refreshAll()" :class="refreshing ? 'opacity-50 cursor-wait' : ''" :disabled="refreshing" class="shrink-0 text-sm text-ink-700 hover:text-accent-700 flex items-center gap-1.5 px-3 py-1.5 rounded-lg hover:bg-cream-100 transition" title="刷新数据 (Cmd/Ctrl+R)">
+      <svg class="w-4 h-4" :class="refreshing ? 'animate-spin' : ''" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+      <span class="hidden sm:inline" x-text="refreshing ? '刷新中' : '刷新'"></span>
+    </button>
     <button @click="exportAll()" class="shrink-0 text-sm text-ink-700 hover:text-accent-700 flex items-center gap-1.5 px-3 py-1.5 rounded-lg hover:bg-cream-100 transition">
       <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
       <span class="hidden sm:inline">导出</span>
@@ -464,6 +468,8 @@ function hippo() {
     timelineTotal: 0,
     hasMore: true,
     loading: false,
+    refreshing: false,
+    lastRefreshAt: 0,
     limit: 50,
     expanded: {},
     filter: { agent_id: null, target: null },
@@ -558,11 +564,42 @@ function hippo() {
           e.preventDefault();
           document.querySelector('input[type=search]').focus();
         }
+        // Cmd/Ctrl+R: refresh data without full page reload
+        if ((e.metaKey || e.ctrlKey) && e.key === 'r' && !e.shiftKey) {
+          e.preventDefault();
+          this.refreshAll();
+        }
+      });
+      // Auto-refresh when tab becomes visible after >30s idle
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' &&
+            Date.now() - this.lastRefreshAt > 30000) {
+          this.refreshAll({ silent: true });
+        }
       });
       await this.loadOverview();
       await this.loadCalendar();
       this.applyDatePreset('30d');  // default view: last 30 days
       this.setupLazyLoad();
+      this.lastRefreshAt = Date.now();
+    },
+
+    async refreshAll(opts = {}) {
+      if (this.refreshing) return;
+      this.refreshing = true;
+      try {
+        await Promise.all([
+          this.loadOverview(),
+          this.loadCalendar(),
+          this.loadTimeline(true),  // reset=true → reload from offset 0
+        ]);
+        this.lastRefreshAt = Date.now();
+        if (!opts.silent) this.notify('已刷新', 'ok');
+      } catch (e) {
+        this.notify('刷新失败', 'err');
+      } finally {
+        this.refreshing = false;
+      }
     },
 
     async loadOverview() {
