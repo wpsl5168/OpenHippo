@@ -174,7 +174,7 @@ class HippoEngine:
                         source="evicted",
                         archived_from=removed["id"],
                     )
-                    self._embed_cold_entry(cold_result["id"])
+                    self._embed_or_enqueue(cold_result["id"], cold_result.get("content") or removed["content"])
                     self.storage._log("evict", removed["id"], {"cold_id": cold_result["id"]})
                     current_chars -= entry_len
                     current_count -= 1
@@ -293,7 +293,7 @@ class HippoEngine:
         result = self.storage.archive(target, old_text)
         # Auto-embed the archived entry
         if "cold_id" in result:
-            self._embed_cold_entry(result["cold_id"])
+            self._embed_or_enqueue(result["cold_id"])
         return result
 
     def cold_add(self, target: str, content: str, source: str = "manual",
@@ -316,7 +316,8 @@ class HippoEngine:
             tags=tags, metadata=metadata,
             agent_id=agent_id, scope=scope, session_id=session_id,
         )
-        self._embed_cold_entry(result["id"])
+        embed_status = self._embed_or_enqueue(result["id"], content)
+        result["embedding_status"] = embed_status
         return result
 
     def _embed_cold_entry(self, memory_id: str) -> bool:
@@ -330,6 +331,55 @@ class HippoEngine:
             return True
         logger.warning("Failed to embed cold entry %s", memory_id)
         return False
+
+    def _embed_or_enqueue(self, memory_id: str, content: str | None = None) -> str:
+        """Embed a cold entry now, or enqueue for the async worker.
+
+        Behavior controlled by env OPENHIPPO_ASYNC_EMBED (default ON).
+        Returns 'sync' or 'pending'. Tests can call embed_drain_now() to flush.
+        """
+        from . import embed_queue
+        if not embed_queue.is_async_enabled():
+            self._embed_cold_entry(memory_id)
+            return "sync"
+        if content is None:
+            entry = self.storage.cold_get(memory_id)
+            if not entry:
+                return "sync"  # nothing to enqueue
+            content = entry["content"]
+        try:
+            embed_queue.enqueue(self.storage._get_conn(), "cold_memory", memory_id, content)
+            return "pending"
+        except Exception as e:
+            # Queue failure must not break writes — fall back to sync.
+            logger.warning("enqueue failed for %s, falling back to sync embed: %s", memory_id, e)
+            self._embed_cold_entry(memory_id)
+            return "sync"
+
+    def embed_drain_now(self, max_jobs: int = 1000) -> dict:
+        """Synchronously drain the embedding job queue.
+
+        Test/CLI helper. Production traffic uses the async worker started in
+        the FastAPI lifespan. Returns counts.
+        """
+        from . import embed_queue
+        conn = self.storage._get_conn()
+        done, failed = 0, 0
+        for _ in range(max_jobs):
+            job = embed_queue.fetch_one_pending(conn)
+            if not job:
+                break
+            try:
+                vec = get_embedding(job["content"])
+                if not vec:
+                    raise RuntimeError("empty embedding")
+                self.storage.vec_store(job["target_id"], vec)
+                embed_queue.mark_done(conn, job["id"])
+                done += 1
+            except Exception as e:
+                embed_queue.mark_failed(conn, job["id"], str(e))
+                failed += 1
+        return {"done": done, "failed": failed}
 
     def embed_all_cold(self) -> dict:
         """Backfill embeddings for all cold memories missing them."""

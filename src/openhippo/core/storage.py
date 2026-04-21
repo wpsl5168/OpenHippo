@@ -148,6 +148,10 @@ class Storage:
         conn.execute("PRAGMA cache_size=-65536")
         conn.execute("PRAGMA temp_store=MEMORY")
         conn.execute("PRAGMA mmap_size=268435456")
+        # Auto-checkpoint when WAL hits 1000 pages (~4MB at default page size).
+        # Combined with hourly TRUNCATE checkpoint via systemd timer, prevents
+        # the WAL file from growing unbounded under sustained writes.
+        conn.execute("PRAGMA wal_autocheckpoint=1000")
         return conn
 
     def _get_conn(self) -> sqlite3.Connection:

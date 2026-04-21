@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from ..core.engine import HippoEngine
+from ..core import embed_queue
 
 # Auth removed in v0.4: OpenHippo is local-first.
 # For remote deployments, use a reverse proxy with auth (Caddy + Cloudflare Access,
@@ -27,6 +28,8 @@ logger = logging.getLogger(__name__)
 # Global engine instance (initialized in lifespan)
 engine: HippoEngine | None = None
 _dream_task: asyncio.Task | None = None
+_embed_task: asyncio.Task | None = None
+_embed_stop: asyncio.Event | None = None
 
 # In-memory runtime counters for the auto-scheduler. Persistent run history
 # lives in dream_runs; these are process-local and complement that view.
@@ -93,8 +96,22 @@ async def _dream_autoloop(interval_seconds: float) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global engine, _dream_task
+    global engine, _dream_task, _embed_task, _embed_stop
     engine = HippoEngine()
+
+    # ── Async embedding worker (PR-perf-async-embed) ──
+    if embed_queue.is_async_enabled():
+        try:
+            reset = embed_queue.reset_running_on_startup(engine.storage._get_conn())
+            if reset:
+                logger.info("embed worker: reset %d stale 'running' jobs to pending", reset)
+        except Exception as e:
+            logger.warning("embed worker: startup reset failed: %s", e)
+        _embed_stop = asyncio.Event()
+        _embed_task = asyncio.create_task(embed_queue.embedding_worker(engine, _embed_stop))
+        logger.info("async embedding worker started (OPENHIPPO_ASYNC_EMBED=1)")
+    else:
+        logger.info("async embedding disabled (OPENHIPPO_ASYNC_EMBED=0); writes embed synchronously")
 
     # Start background dream loop unless explicitly disabled.
     # Knob: env OPENHIPPO_DREAM_AUTO=0 disables; OPENHIPPO_DREAM_INTERVAL_HOURS overrides default.
@@ -111,6 +128,12 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if _embed_task is not None and _embed_stop is not None:
+            _embed_stop.set()
+            try:
+                await asyncio.wait_for(_embed_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                _embed_task.cancel()
         if _dream_task is not None:
             _dream_task.cancel()
             try:
@@ -246,7 +269,12 @@ def get_hot(target: str | None = None):
 
 @app.get("/v1/stats")
 def get_stats():
-    return {"data": _engine().stats()}
+    stats = _engine().stats()
+    try:
+        stats["embed_queue"] = embed_queue.queue_stats(_engine().storage._get_conn())
+    except Exception as e:
+        logger.debug("embed queue stats unavailable: %s", e)
+    return {"data": stats}
 
 
 @app.get("/v1/overview")
