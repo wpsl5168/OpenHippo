@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import threading
+import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 from collections import OrderedDict
@@ -101,25 +102,45 @@ class OllamaProvider(EmbeddingProvider):
     def dimension(self) -> int:
         return EMBEDDING_DIM
 
+    # nomic-embed-text 默认 ctx ≈ 2048 token；中英混合保守取 ~1800 chars,超出 Ollama 直接返 500。
+    MAX_PROMPT_CHARS = 1800
+
+    def _post(self, prompt: str) -> Optional[list[float]]:
+        payload = json.dumps({"model": self.model, "prompt": prompt}).encode()
+        req = urllib.request.Request(
+            f"{self.base_url}/api/embeddings",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            data = json.loads(resp.read())
+            vec = data.get("embedding")
+            if vec and len(vec) == self.dimension:
+                return _l2_normalize(vec)
+            logger.warning("Unexpected dim: %d (expected %d)", len(vec) if vec else 0, self.dimension)
+            return vec if vec else None
+
     def embed(self, text: str) -> Optional[list[float]]:
-        try:
-            payload = json.dumps({"model": self.model, "prompt": text}).encode()
-            req = urllib.request.Request(
-                f"{self.base_url}/api/embeddings",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                data = json.loads(resp.read())
-                vec = data.get("embedding")
-                if vec and len(vec) == self.dimension:
-                    return _l2_normalize(vec)
-                logger.warning("Unexpected dim: %d (expected %d)", len(vec) if vec else 0, self.dimension)
-                return vec if vec else None
-        except Exception as e:
-            logger.warning("Ollama embedding failed: %s", e)
+        if not text:
             return None
+        # 主截断 + 自适应回退：超长内容截到 MAX_PROMPT_CHARS,如仍 500 则继续减半,直到 500 chars 放弃。
+        attempt_lens = [self.MAX_PROMPT_CHARS, 1200, 800, 400]
+        attempt_lens = [n for n in attempt_lens if n <= self.MAX_PROMPT_CHARS] or [self.MAX_PROMPT_CHARS]
+        for n in attempt_lens:
+            prompt = text[:n] if len(text) > n else text
+            try:
+                return self._post(prompt)
+            except urllib.error.HTTPError as e:
+                if e.code == 500 and n > 500:
+                    logger.warning("Ollama 500 at prompt len=%d, retry shorter", n)
+                    continue
+                logger.warning("Ollama embedding failed: %s", e)
+                return None
+            except Exception as e:
+                logger.warning("Ollama embedding failed: %s", e)
+                return None
+        return None
 
 
 class SentenceTransformerProvider(EmbeddingProvider):
