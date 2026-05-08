@@ -187,6 +187,8 @@ HIPPO_SERVER_PORT=9000           # Custom port
 
 Both backends use `nomic-embed-text-v1.5` (768 dimensions) by default for consistent vector quality.
 
+> **Note on long content (Ollama backend):** `nomic-embed-text` has a 2048-token context window. Inputs over ~1800 chars (especially CJK text, where one character ≈ 2-3 tokens) trigger HTTP 500 from Ollama. `OllamaProvider` automatically truncates prompts to `MAX_PROMPT_CHARS=1800` and falls back through `[1800 → 1200 → 800 → 400]` chars on 500 errors, so long memories embed cleanly without manual chunking. If you need the full content searchable as multiple vectors, split it into chunks before calling `add_memory`.
+
 ## Agent Integration (Hook/Plugin)
 
 OpenHippo integrates with AI agents via a **hook/plugin system** — no manual API calls needed. The agent's memory operations are automatically mirrored to OpenHippo in the background.
