@@ -259,6 +259,23 @@ ruff check src/
 mypy src/
 ```
 
+## FAQ: Why local-first?
+
+**Q: Why not use a hosted memory service like Mem0 or Zep?**
+Local-first means your conversations and memories never leave your machine. No third-party retains a copy, no vendor lock-in, no surprise pricing or shutdown. You own the SQLite file — back it up, move it, delete it, fork the schema. Hosted services optimize for their own retention; OpenHippo optimizes for yours.
+
+**Q: Is SQLite really fast enough for memory storage?**
+Yes, for the realistic load. With WAL mode and `sqlite-vec` for ANN search, a single SQLite file comfortably handles hundreds of thousands of memories with sub-50ms hybrid queries on commodity hardware. Most agents accumulate thousands, not billions, of memories — Postgres or a vector DB is overkill until you actually hit that scale.
+
+**Q: How do I integrate OpenHippo with my existing agent?**
+Two paths, pick whichever fits. The hook/plugin route auto-captures conversations from supported agent frameworks with zero glue code (see [Agent Integration (Hook/Plugin)](#agent-integration-hookplugin)). The REST API route gives you full CRUD over `/v1/memories` and search via `/v1/search` — works with any language or framework that speaks HTTP.
+
+**Q: How do I back up my memories?**
+The entire store is one SQLite file (`hippocampus.db` by default). Copy it with `cp`, sync with `rsync`, version it with `git`, snapshot it with your filesystem — any tool that handles a single file works. No dump/restore tooling, no migrations, no proprietary export format.
+
+**Q: Can I run completely offline (no network)?**
+Yes. Use the local `sentence-transformers` embedding backend or a local Ollama instance and OpenHippo never makes an outbound call. The SQLite store, FTS5 search, vector search, and Dream consolidation all run entirely in-process. Air-gapped deployments work out of the box.
+
 ## Roadmap
 
 - [x] Hot/cold memory tiering with capacity management
