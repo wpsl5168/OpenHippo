@@ -276,6 +276,9 @@ The entire store is one SQLite file (`hippocampus.db` by default). Copy it with 
 **Q: Can I run completely offline (no network)?**
 Yes. Use the local `sentence-transformers` embedding backend or a local Ollama instance and OpenHippo never makes an outbound call. The SQLite store, FTS5 search, vector search, and Dream consolidation all run entirely in-process. Air-gapped deployments work out of the box.
 
+**Q: How is this project developed?**
+Dev/QA/Ship three-stage workflow via the `hermes-team` wrapper — a developer agent writes the code, a QA agent reviews it, and a ship agent merges to main and cleans up branches. See `~/.hermes/skills/devops/team-sop` for the full SOP.
+
 ## Roadmap
 
 - [x] Hot/cold memory tiering with capacity management
