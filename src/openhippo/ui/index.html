@@ -68,15 +68,15 @@
   input:focus { outline: none; }
 
   /* Timeline spine */
-  .tl-spine { position: relative; padding-left: 2.5rem; }
+  .tl-spine { position: relative; padding-left: 1.5rem; }
   .tl-spine::before {
-    content: ''; position: absolute; left: 0.9375rem; top: 8px; bottom: 8px;
+    content: ''; position: absolute; left: 0.4375rem; top: 8px; bottom: 8px;
     width: 2px; background: #e7e2d0;
     border-radius: 2px;
   }
   .tl-node { position: relative; }
   .tl-node::before {
-    content: ''; position: absolute; left: -1.9375rem; top: 1.5rem;
+    content: ''; position: absolute; left: -1.0625rem; top: 1.25rem;
     width: 14px; height: 14px; border-radius: 999px;
     background: #c7bff5;
     border: 3px solid #fdfcf9;
@@ -137,8 +137,9 @@
   .md-body h3 { font-size: 1.1rem; font-weight: 600; margin: 0.5rem 0 0.25rem; }
   .md-body h4, .md-body h5, .md-body h6 { font-size: 1rem; font-weight: 600; margin: 0.5rem 0 0.25rem; }
   .md-body p { margin: 0.35rem 0; }
-  .md-body ul, .md-body ol { margin: 0.35rem 0; padding-left: 1.5rem; }
-  .md-body li { margin: 0.05rem 0; }
+  .md-body ul, .md-body ol { margin: 0.3rem 0; padding-left: 1.25rem; }
+  .md-body li { margin: 0; }
+  .md-body li > p { margin: 0.15rem 0; }
   .md-body ul { list-style: disc; }
   .md-body ol { list-style: decimal; }
   .md-body a { color: #5544bf; text-decoration: underline; text-underline-offset: 2px; }
@@ -244,7 +245,7 @@
   <div class="px-4 py-2 rounded-lg text-sm" :class="noticeType==='err' ? 'bg-rose-50 text-rose-700 border border-rose-200' : 'bg-emerald-50 text-emerald-700 border border-emerald-200'" x-text="notice"></div>
 </div>
 
-<main class="max-w-6xl mx-auto px-4 md:px-6 py-8">
+<main class="max-w-6xl mx-auto px-2 md:px-6 py-8">
 
 <!-- ═══════════ OVERVIEW ═══════════ -->
 <section class="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-5 mb-10">
@@ -417,7 +418,7 @@
             <article
               :id="'mem-' + item.id"
               :class="'tl-node target-' + item.target"
-              class="bg-white rounded-xl border border-cream-200 shadow-card hover:shadow-cardHover transition px-4 py-3 group">
+              class="bg-white rounded-xl border border-cream-200 shadow-card hover:shadow-cardHover transition px-3 md:px-4 py-3 group">
               <div class="flex items-center gap-2 mb-1.5">
                 <span class="pill" :class="item.target === 'user' ? 'pill-user' : 'pill-memory'" x-text="targetLabel(item.target)"></span>
                 <span class="text-[11px] text-ink-500 font-mono" x-text="fmtTime(item.created_at)"></span>
