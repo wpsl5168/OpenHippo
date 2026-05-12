@@ -101,7 +101,7 @@
   /* Content typography */
   .hippo-body {
     font-family: "Noto Serif SC", "Songti SC", Georgia, serif;
-    font-size: 15.5px; line-height: 1.85; color: #1a1a1a;
+    font-size: 12px; line-height: 1.6; color: #1a1a1a;
     font-weight: 400;
   }
   .hippo-body code,
@@ -242,39 +242,7 @@
     </button>
   </div>
 
-  <!-- Card 2: 30-day activity -->
-  <div class="bg-white rounded-2xl border border-cream-200 shadow-card p-6">
-    <div class="flex items-center justify-between">
-      <div class="text-xs uppercase tracking-widest text-ink-500 font-medium">最近 30 天</div>
-      <div class="text-xs text-ink-500">共 <span class="text-ink-900 font-medium" x-text="recent30Total"></span> 条</div>
-    </div>
-    <!-- sparkline -->
-    <div class="mt-5 flex items-end gap-[3px] h-16">
-      <template x-for="d in overview.daily_counts_30d || []" :key="d.date">
-        <div class="flex-1 relative group">
-          <div
-            class="spark-bar rounded-sm cursor-pointer"
-            :style="{
-              height: Math.max(2, (d.count / Math.max(1, spark_max)) * 100) + '%',
-              background: d.count === 0 ? '#e7e2d0' : '#7c6eea',
-              opacity: d.count === 0 ? 0.5 : (0.4 + 0.6 * (d.count / Math.max(1, spark_max)))
-            }"
-            @click="d.count > 0 && scrollToDate(d.date)"
-            :title="d.date + ' · ' + d.count + ' 条'"></div>
-        </div>
-      </template>
-    </div>
-    <div class="mt-3 flex justify-between text-[10px] text-ink-400">
-      <span x-text="overview.daily_counts_30d?.[0]?.date?.slice(5) || ''"></span>
-      <span x-show="recent30Peak">最活跃 <span class="text-ink-700" x-text="recent30Peak"></span></span>
-      <span>今天</span>
-    </div>
-    <div class="mt-4 text-xs text-ink-500">
-      日均 <span class="text-ink-900 font-medium" x-text="(recent30Total / 30).toFixed(1)"></span> 条 · 点击柱子跳转到那天
-    </div>
-  </div>
-
-  <!-- Card 3: agent distribution doughnut -->
+  <!-- Card 2: agent distribution doughnut -->
   <div class="bg-white rounded-2xl border border-cream-200 shadow-card p-6">
     <div class="flex items-center justify-between">
       <div class="text-xs uppercase tracking-widest text-ink-500 font-medium">来源分布</div>
@@ -300,6 +268,25 @@
           </button>
         </template>
       </div>
+    </div>
+  </div>
+
+  <!-- Card 3: topic tag cloud -->
+  <div class="bg-white rounded-2xl border border-cream-200 shadow-card p-6">
+    <div class="flex items-center justify-between">
+      <div class="text-xs uppercase tracking-widest text-ink-500 font-medium">话题标签</div>
+      <div x-show="filter.tag" class="text-xs text-accent-600 cursor-pointer hover:underline" @click="setTagFilter(null)">清除筛选</div>
+    </div>
+    <div class="mt-3 flex flex-wrap gap-1.5 leading-tight" style="max-height:140px;overflow:hidden">
+      <template x-for="t in (tagCloud || []).slice(0, 30)" :key="t.tag">
+        <button
+          @click="setTagFilter(t.tag === filter.tag ? null : t.tag)"
+          :class="filter.tag === t.tag ? 'bg-accent-600 text-white' : 'bg-cream-100 text-ink-700 hover:bg-cream-200'"
+          :style="{ fontSize: tagSize(t.count) + 'px' }"
+          class="px-2 py-0.5 rounded-full transition tabular-nums"
+          x-text="t.tag + ' ' + t.count"></button>
+      </template>
+      <div x-show="!tagCloud?.length" class="text-xs text-ink-400">暂无标签 (打标进行中)</div>
     </div>
   </div>
 </section>
@@ -386,23 +373,23 @@
   </div>
 
   <!-- Day groups -->
-  <div class="space-y-10">
+  <div class="space-y-5">
     <template x-for="group in groupedTimeline" :key="group.key">
       <div>
-        <div class="day-divider flex items-center my-6">
+        <div class="day-divider flex items-center my-3">
           <span class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-cream-100 border border-cream-300 text-xs font-medium text-ink-700">
             <span class="w-1.5 h-1.5 rounded-full bg-accent-600"></span>
             <span x-text="group.label"></span>
             <span class="text-ink-500" x-text="'· ' + group.items.length + ' 条'"></span>
           </span>
         </div>
-        <div class="tl-spine space-y-5">
+        <div class="tl-spine space-y-2">
           <template x-for="item in group.items" :key="item.id">
             <article
               :id="'mem-' + item.id"
               :class="'tl-node target-' + item.target"
-              class="bg-white rounded-xl border border-cream-200 shadow-card hover:shadow-cardHover transition p-6 group">
-              <div class="flex items-center gap-2 mb-3">
+              class="bg-white rounded-xl border border-cream-200 shadow-card hover:shadow-cardHover transition px-4 py-3 group">
+              <div class="flex items-center gap-2 mb-1.5">
                 <span class="pill" :class="item.target === 'user' ? 'pill-user' : 'pill-memory'" x-text="targetLabel(item.target)"></span>
                 <span class="text-[11px] text-ink-500 font-mono" x-text="fmtTime(item.created_at)"></span>
                 <span x-show="item.agent_id" class="ml-auto text-[10px] font-mono px-1.5 py-0.5 bg-cream-100 text-ink-500 rounded" x-text="item.agent_id"></span>
@@ -411,7 +398,7 @@
                 class="hippo-body whitespace-pre-wrap break-words"
                 :class="!expanded[item.id] && item.content.length > 280 ? 'content-fade' : ''"
                 x-html="highlight(item.content, committedQuery)"></div>
-              <div class="mt-4 flex items-center justify-between text-xs">
+              <div class="mt-2 flex items-center justify-between text-xs">
                 <button
                   x-show="item.content.length > 280"
                   @click="expanded[item.id] = !expanded[item.id]"
@@ -472,7 +459,8 @@ function hippo() {
     lastRefreshAt: 0,
     limit: 50,
     expanded: {},
-    filter: { agent_id: null, target: null },
+    filter: { agent_id: null, target: null, tag: null },
+    tagCloud: [],
 
     // ──────── date scrubber ────────
     calendar: [],            // [{date, count}] last N days
@@ -590,6 +578,7 @@ function hippo() {
       try {
         await Promise.all([
           this.loadOverview(),
+          this.loadTags(),
           this.loadCalendar(),
           this.loadTimeline(true),  // reset=true → reload from offset 0
         ]);
@@ -619,6 +608,7 @@ function hippo() {
         const params = new URLSearchParams({ limit: this.limit, offset: this.timeline.length });
         if (this.filter.agent_id) params.set('agent_id', this.filter.agent_id);
         if (this.filter.target) params.set('target', this.filter.target);
+        if (this.filter.tag) params.set('tag', this.filter.tag);
         const dr = this.computeDateBounds();
         if (dr.from_ts !== null) params.set('date_from', dr.from_ts);
         if (dr.to_ts !== null) params.set('date_to', dr.to_ts);
@@ -756,6 +746,24 @@ function hippo() {
       this.filter.agent_id = agentKey;
       await this.loadCalendar();
       await this.loadTimeline(true);
+    },
+
+    async setTagFilter(tag) {
+      this.filter.tag = tag;
+      await this.loadTimeline(true);
+    },
+
+    tagSize(count) {
+      const max = (this.tagCloud[0]?.count) || 1;
+      return Math.round(11 + (count / max) * 7);  // 11–18px
+    },
+
+    async loadTags() {
+      try {
+        const r = await fetch('/v1/tags?min_count=1&limit=60');
+        const j = await r.json();
+        this.tagCloud = j.data || [];
+      } catch (e) { console.warn('loadTags fail', e); }
     },
 
     // ──────── date scrubber ────────

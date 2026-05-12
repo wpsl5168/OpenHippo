@@ -9,10 +9,18 @@ from contextlib import asynccontextmanager
 
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse, RedirectResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+
+# ── Strict request model base ──
+# All API request models inherit this so unknown fields (Pydantic default: ignore)
+# are rejected with 422 instead of silently swallowed. Caught by Schemathesis fuzz
+# on 2026-04-28 (4 endpoints accepted schema-violating extras).
+class _StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 from ..core.engine import HippoEngine
 from ..core import embed_queue
@@ -151,6 +159,22 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+# ── Global exception handlers ──
+# Engine layer raises ValueError for invalid args (bad target, bad scope, etc.).
+# Without this handler FastAPI lets them bubble up as 500. They're client errors,
+# not server errors — return 422 with the message. Caught by Schemathesis fuzz
+# on 2026-04-28 (5 endpoints returned 500 on invalid inputs that should be 422).
+@app.exception_handler(ValueError)
+async def _value_error_handler(request: Request, exc: ValueError):
+    # Match FastAPI's HTTPValidationError shape (detail = array of ValidationError)
+    # so OpenAPI 422 schema stays valid. Plain {"detail": "string"} breaks
+    # response-schema-conformance tests (caught by Schemathesis 2026-04-28 round 2).
+    return JSONResponse(
+        status_code=422,
+        content={"detail": [{"loc": ["body"], "msg": str(exc), "type": "value_error"}]},
+    )
+
 _conf = get_config()
 # NOTE: OpenHippo is a local-first service. It binds to 127.0.0.1 by default
 # and ships with NO authentication. If you expose it remotely, put a reverse
@@ -166,37 +190,38 @@ def _engine() -> HippoEngine:
 
 # ── Request/Response Models ──
 
-class AddRequest(BaseModel):
+class AddRequest(_StrictModel):
     target: str = Field("memory", description="'memory' or 'user'")
     content: str = Field(..., description="Memory content")
     agent_id: str | None = Field(None, description="Source agent identity")
     session_id: str | None = Field(None, description="Source session id")
     scope: str = Field("agent", description="'agent' or 'shared'")
 
-class ReplaceRequest(BaseModel):
+class ReplaceRequest(_StrictModel):
     target: str = Field("memory")
     old_text: str = Field(..., description="Unique substring to identify entry")
     new_content: str = Field(..., description="Replacement content")
 
-class RemoveRequest(BaseModel):
+class RemoveRequest(_StrictModel):
     target: str = Field("memory")
     old_text: str = Field(..., description="Unique substring to identify entry")
 
-class SearchRequest(BaseModel):
+class SearchRequest(_StrictModel):
     query: str
     target: str | None = None
-    source: str = Field("all", description="'all', 'hot', 'cold'")
+    source: str = Field("all", description="'all', 'hot', 'cold' — storage tier")
     limit: int = Field(20, ge=1, le=100)
     mode: str = Field("hybrid", description="'hybrid' (FTS+vec RRF), 'fts', 'vector'")
+    origin: str | None = Field(None, description="Filter cold rows by writer category (cm.source), e.g. 'session_summary'. None = no filter.")
 
-class ArchiveRequest(BaseModel):
+class ArchiveRequest(_StrictModel):
     target: str = Field("memory")
     old_text: str = Field(..., description="Unique substring to identify hot entry")
 
-class PromoteRequest(BaseModel):
+class PromoteRequest(_StrictModel):
     memory_id: str = Field(..., description="Cold memory ID to promote")
 
-class ColdAddRequest(BaseModel):
+class ColdAddRequest(_StrictModel):
     target: str = Field("memory", description="'memory' or 'user'")
     content: str = Field(..., description="Memory content")
     source: str = Field("manual", description="e.g. 'manual', 'snapshot', 'session_start'")
@@ -228,7 +253,7 @@ def cold_add_memory(req: ColdAddRequest):
 
 @app.post("/v1/memories/search")
 def search_memories(req: SearchRequest):
-    return {"data": _engine().search(req.query, req.target, req.source, req.limit, req.mode)}
+    return {"data": _engine().search(req.query, req.target, req.source, req.limit, req.mode, origin=req.origin)}
 
 @app.post("/v1/memories/replace")
 def replace_memory(req: ReplaceRequest):
@@ -292,15 +317,17 @@ def memories_all(
     offset: int = 0,
     date_from: float | None = None,
     date_to: float | None = None,
+    tag: str | None = None,
 ):
     """Unified timeline (hot+cold combined) for end-user UI.
-    Supports pagination via limit+offset and filtering by target/agent_id/date range.
+    Supports pagination via limit+offset and filtering by target/agent_id/date range/tag.
     date_from/date_to are unix timestamps (inclusive lower, exclusive upper).
+    tag filters cold rows where tags JSON contains 'topic:<tag>' (hot excluded when tag set).
     Returns {items, total, has_more} envelope for infinite-scroll UIs.
     """
     e = _engine()
-    items = e.unified_timeline(target, agent_id, limit, offset, date_from, date_to)
-    total = e.unified_count(target, agent_id, date_from, date_to)
+    items = e.unified_timeline(target, agent_id, limit, offset, date_from, date_to, tag)
+    total = e.unified_count(target, agent_id, date_from, date_to, tag)
     return {"data": {
         "items": items,
         "total": total,
@@ -322,11 +349,20 @@ def get_calendar(
     """
     return {"data": _engine().daily_calendar(target, agent_id, days)}
 
+
+@app.get("/v1/tags")
+def get_tags(min_count: int = 2, limit: int = 200):
+    """Topic tag cloud — aggregates 'topic:xxx' tags from cold_memory.tags JSON.
+    System tags (snapshot/session:/telegram/...) are excluded.
+    """
+    return {"data": _engine().topic_tags(min_count=min_count, limit=limit)}
+
+
 @app.get("/v1/logs")
 def get_logs(limit: int = 50):
     return {"data": _engine().get_logs(limit)}
 
-class UpdateMemoryRequest(BaseModel):
+class UpdateMemoryRequest(_StrictModel):
     content: str = Field(..., description="New content for the memory")
 
 
@@ -468,7 +504,7 @@ def backfill_embeddings():
     return {"data": _engine().embed_all_cold()}
 
 
-class ImportRequest(BaseModel):
+class ImportRequest(_StrictModel):
     data: dict = Field(..., description="Exported JSON document (with header + memories)")
     reembed: bool = Field(False, description="Force re-compute embeddings")
     dry_run: bool = Field(False, description="Preview only, don't write")
@@ -485,7 +521,7 @@ def import_memories(req: ImportRequest):
 
 # ── F5 Dream — sleep-inspired consolidation ──
 
-class DreamPreviewRequest(BaseModel):
+class DreamPreviewRequest(_StrictModel):
     target: str | None = Field(None, description="Restrict to 'memory' or 'user'; None = all")
     l2_threshold: float = Field(0.55, ge=0.1, le=2.0, description="L2 distance ceiling for clustering")
     min_cluster_size: int = Field(2, ge=2, le=20)
@@ -520,7 +556,7 @@ def dream_runs_list(limit: int = 20):
     return {"data": eng.list_runs(limit=limit)}
 
 
-class DreamRunRequest(BaseModel):
+class DreamRunRequest(_StrictModel):
     target: str | None = Field(None, description="Restrict to 'memory' or 'user'; None = all")
     l2_threshold: float = Field(0.55, ge=0.1, le=2.0)
     min_cluster_size: int = Field(2, ge=2, le=20)

@@ -548,7 +548,6 @@ class DreamEngine:
 
         rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
         forgotten = 0
-        now_iso = _iso(now)
 
         for r in rows:
             age_days = max(0.0, (now - float(r["created_at"])) / 86400.0)
@@ -558,12 +557,19 @@ class DreamEngine:
             if decay <= cfg.forget_threshold:
                 continue
 
-            conn.execute(
-                """UPDATE cold_memory
-                   SET dream_status = 'dormant', last_dream_at = ?
-                   WHERE id = ? AND COALESCE(dream_status, 'active') = 'active'""",
-                (now_iso, r["id"]),
+            # F5 v0.3: route through _mark_dormant so dream-decay path shares
+            # the same audit shape (action='mark_dormant', reason='forget_decay')
+            # as user-driven removes. We pass dream_run_id so we don't spin up
+            # a synthetic 'manual:' run.
+            self.storage._mark_dormant(
+                r["id"],
+                actor="dream",
+                reason="forget_decay",
+                source_tier="cold",
+                dream_run_id=run_id,
             )
+            # Augment the audit row with decay metrics (separate row keeps the
+            # mark_dormant payload uniform across actors).
             conn.execute(
                 """INSERT INTO dream_actions
                    (dream_run_id, action, memory_id, details, created_at)
@@ -577,7 +583,7 @@ class DreamEngine:
                         "importance": importance,
                         "threshold": cfg.forget_threshold,
                     }),
-                    now_iso,
+                    _iso(now),
                 ),
             )
             forgotten += 1
@@ -645,6 +651,120 @@ class DreamEngine:
             "status": "restored",
             "from": prev_status,
             "run_id": run_id,
+        }
+
+    # ── F5 v0.3 purge: physically delete overdue dormant rows ──
+    def purge_overdue_dormant(self, *, dry_run: bool = False,
+                              now: float | None = None) -> dict:
+        """Physically delete dormant cold rows whose retention period has
+        elapsed. Retention is differentiated by mark_dormant.details.reason
+        (RETENTION_DAYS_BY_REASON). FTS5 external-content table follows the
+        main table automatically; vec rows must be deleted explicitly.
+
+        Returns counts; never raises on per-row failures (logs and continues).
+        Wrapped in BEGIN/COMMIT/ROLLBACK to keep cold/vec/audit consistent
+        per memory.
+        """
+        conn = self.storage._get_conn()
+        now = now if now is not None else time.time()
+        run_id = f"purge:{uuid.uuid4().hex}"
+        now_iso = _iso(now)
+
+        # Pick latest mark_dormant audit row per memory to learn the reason.
+        # Window function not needed — GROUP BY MAX(created_at) is enough.
+        candidates = conn.execute("""
+            SELECT cm.id,
+                   cm.last_dream_at,
+                   (SELECT da.details
+                      FROM dream_actions da
+                     WHERE da.memory_id = cm.id
+                       AND da.action    = 'mark_dormant'
+                     ORDER BY da.created_at DESC LIMIT 1) AS details_json
+              FROM cold_memory cm
+             WHERE cm.dream_status = 'dormant'
+               AND cm.last_dream_at IS NOT NULL
+        """).fetchall()
+
+        eligible: list[tuple[str, str]] = []  # (memory_id, reason)
+        for r in candidates:
+            mid = r["id"]
+            try:
+                # last_dream_at is ISO-8601 (see _mark_dormant)
+                from datetime import datetime
+                ts_str = r["last_dream_at"]
+                # Strip trailing Z and parse
+                t = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                marked_at = t.timestamp()
+            except Exception as e:
+                logger.warning("purge: bad last_dream_at for %s: %s", mid, e)
+                continue
+
+            reason = "unknown"
+            details = r["details_json"]
+            if details:
+                try:
+                    reason = (json.loads(details).get("reason") or "unknown")
+                except Exception:
+                    pass
+
+            retention_days = RETENTION_DAYS_BY_REASON.get(reason, DEFAULT_RETENTION_DAYS)
+            age_days = (now - marked_at) / 86400.0
+            if age_days >= retention_days:
+                eligible.append((mid, reason))
+
+        if dry_run or not eligible:
+            return {
+                "run_id": run_id,
+                "dry_run": dry_run,
+                "candidates": len(candidates),
+                "eligible": len(eligible),
+                "purged": 0,
+                "by_reason": _count_reasons(eligible),
+            }
+
+        # Synthetic dream_run for FK + audit grouping. OR IGNORE makes
+        # re-runs idempotent at the run level.
+        conn.execute(
+            """INSERT OR IGNORE INTO dream_runs
+               (id, started_at, finished_at, status, config_snapshot,
+                candidates_count, clusters_count, consolidated_count, forgotten_count)
+               VALUES (?, ?, ?, 'purge', ?, 0, 0, 0, 0)""",
+            (run_id, now_iso, now_iso,
+             json.dumps({"job": "purge_overdue_dormant"})),
+        )
+
+        purged = 0
+        for mid, reason in eligible:
+            try:
+                # python sqlite3 auto-opens a transaction on the first DML.
+                # Inline vec deletes — calling self.storage.vec_delete() would
+                # commit mid-transaction and break rollback semantics.
+                conn.execute("DELETE FROM cold_embeddings WHERE memory_id=?", (mid,))
+                conn.execute("DELETE FROM cold_memory_vec WHERE memory_id=?", (mid,))
+                conn.execute("DELETE FROM cold_memory WHERE id=?", (mid,))
+                conn.execute(
+                    """INSERT INTO dream_actions
+                       (dream_run_id, action, memory_id, details, created_at)
+                       VALUES (?, 'purge_dormant', ?, ?, ?)""",
+                    (run_id, mid,
+                     json.dumps({"actor": "dream", "reason": reason,
+                                 "retention_days": RETENTION_DAYS_BY_REASON.get(
+                                     reason, DEFAULT_RETENTION_DAYS)}),
+                     now_iso),
+                )
+                conn.commit()
+                purged += 1
+            except Exception as e:
+                conn.rollback()
+                logger.warning("purge: failed for %s: %s", mid, e)
+
+        return {
+            "run_id": run_id,
+            "dry_run": False,
+            "candidates": len(candidates),
+            "eligible": len(eligible),
+            "purged": purged,
+            "by_reason": _count_reasons(eligible),
         }
 
     # ── Run history ──
@@ -729,3 +849,23 @@ def _iso(ts: float) -> str:
     """ISO-8601 UTC string from epoch seconds."""
     from datetime import datetime, timezone
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+# ── F5 v0.3 retention policy ──
+# Differentiated retention by mark_dormant.details.reason. After this many
+# days dormant, the row is eligible for physical purge by purge_overdue_dormant.
+RETENTION_DAYS_BY_REASON: dict[str, int] = {
+    "legacy_test_residue": 0,    # immediate cleanup
+    "hot_remove": 14,            # generous — hot was user-driven recent action
+    "cold_delete": 7,            # API delete intent is explicit
+    "forget_decay": 30,          # decay-based, give plenty of restore window
+    "consolidate_promoted": 7,   # cold-side replica after promote
+}
+DEFAULT_RETENTION_DAYS = 30  # fallback for any reason not in the map
+
+
+def _count_reasons(eligible: list[tuple[str, str]]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for _mid, reason in eligible:
+        out[reason] = out.get(reason, 0) + 1
+    return out

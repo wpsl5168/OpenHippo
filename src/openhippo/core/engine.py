@@ -190,19 +190,24 @@ class HippoEngine:
 
     def search(self, query: str, target: str | None = None,
                source: str = "all", limit: int = 20,
-               mode: str = "hybrid") -> dict:
+               mode: str = "hybrid", origin: str | None = None) -> dict:
         """Search memories across hot and cold storage.
         
         Args:
             query: search keywords
             target: filter by 'memory' or 'user', or None for both
-            source: 'all', 'hot', 'cold'
+            source: 'all', 'hot', 'cold' (storage tier)
             limit: max results
             mode: 'hybrid' (FTS+vec RRF), 'fts', 'vector'
+            origin: filter cold rows by writer category (cm.source field), e.g.
+                    'session_summary' to retrieve only per-session summaries.
+                    None disables the filter. Hot tier ignores this filter
+                    since hot entries are short-lived per-target memory.
         """
         results = {"query": query, "hot": [], "cold": [], "mode": mode}
 
-        if source in ("all", "hot"):
+        # Hot tier ignores origin (no source field on hot entries).
+        if source in ("all", "hot") and not origin:
             hot_entries = self.storage.hot_list(target)
             query_lower = query.lower()
             keywords = query_lower.split()
@@ -213,35 +218,36 @@ class HippoEngine:
 
         if source in ("all", "cold"):
             if mode == "fts":
-                results["cold"] = self.storage.cold_search(query, target, limit)
+                results["cold"] = self.storage.cold_search(query, target, limit, origin=origin)
             elif mode == "vector":
-                results["cold"] = self._vec_search(query, target, limit)
+                results["cold"] = self._vec_search(query, target, limit, origin=origin)
             else:  # hybrid
-                results["cold"] = self._hybrid_search(query, target, limit)
+                results["cold"] = self._hybrid_search(query, target, limit, origin=origin)
 
         results["total"] = len(results["hot"]) + len(results["cold"])
         return results
 
-    def _vec_search(self, query: str, target: str | None, limit: int) -> list[dict]:
+    def _vec_search(self, query: str, target: str | None, limit: int,
+                    origin: str | None = None) -> list[dict]:
         """Pure vector search."""
         vec = get_embedding(query)
         if not vec:
             logger.warning("Embedding failed, falling back to FTS")
-            return self.storage.cold_search(query, target, limit)
-        return self.storage.vec_search(vec, target, limit)
+            return self.storage.cold_search(query, target, limit, origin=origin)
+        return self.storage.vec_search(vec, target, limit, origin=origin)
 
     def _hybrid_search(self, query: str, target: str | None, limit: int,
-                       rrf_k: int = 60) -> list[dict]:
+                       rrf_k: int = 60, origin: str | None = None) -> list[dict]:
         """Hybrid search: FTS5 + vector, fused with RRF (Reciprocal Rank Fusion).
         
         Score = Σ 1/(k + rank_i) for each retrieval path.
         """
         # FTS path
-        fts_results = self.storage.cold_search(query, target, limit)
-        
+        fts_results = self.storage.cold_search(query, target, limit, origin=origin)
+
         # Vector path
         vec = get_embedding(query)
-        vec_results = self.storage.vec_search(vec, target, limit) if vec else []
+        vec_results = self.storage.vec_search(vec, target, limit, origin=origin) if vec else []
 
         if not vec_results:
             # No embeddings available, return FTS only
@@ -454,20 +460,26 @@ class HippoEngine:
                          agent_id: str | None = None,
                          limit: int = 50, offset: int = 0,
                          date_from: float | None = None,
-                         date_to: float | None = None) -> list[dict]:
+                         date_to: float | None = None,
+                         tag: str | None = None) -> list[dict]:
         """Combined hot+cold timeline for end-user UI."""
-        return self.storage.unified_timeline(target, agent_id, limit, offset, date_from, date_to)
+        return self.storage.unified_timeline(target, agent_id, limit, offset, date_from, date_to, tag)
 
     def unified_count(self, target: str | None = None,
                       agent_id: str | None = None,
                       date_from: float | None = None,
-                      date_to: float | None = None) -> int:
-        return self.storage.unified_count(target, agent_id, date_from, date_to)
+                      date_to: float | None = None,
+                      tag: str | None = None) -> int:
+        return self.storage.unified_count(target, agent_id, date_from, date_to, tag)
 
     def daily_calendar(self, target: str | None = None,
                        agent_id: str | None = None,
                        days: int = 365) -> list[dict]:
         return self.storage.daily_calendar(target, agent_id, days)
+
+    def topic_tags(self, min_count: int = 2, limit: int = 200) -> list[dict]:
+        """Aggregate topic:* tags across cold_memory, return [{tag, count}] desc."""
+        return self.storage.topic_tags(min_count=min_count, limit=limit)
 
     # ── Logs ──
 

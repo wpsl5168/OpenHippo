@@ -7,6 +7,7 @@ Threading model:
 """
 
 import hashlib
+import json
 import logging
 import sqlite3
 import struct
@@ -206,6 +207,24 @@ class Storage:
         conn.commit()
         return {"id": mid, "status": "created"}
 
+    @staticmethod
+    def _pick_best_match(rows, old_text: str):
+        """Pick the best match when LIKE returns multiple rows.
+
+        Priority: (1) exact content equality, (2) shortest content (most
+        specific match — short entries are more likely the user's intended
+        target than long entries that happen to contain the substring).
+        Compatible with hermes-side first-match semantics.
+        """
+        if len(rows) == 1:
+            return rows[0]
+        # Exact match first
+        for r in rows:
+            if r["content"].strip() == old_text.strip():
+                return r
+        # Otherwise: shortest wins
+        return min(rows, key=lambda r: len(r["content"]))
+
     def hot_replace(self, target: str, old_text: str, new_content: str) -> dict:
         conn = self._get_conn()
         rows = conn.execute(
@@ -214,17 +233,22 @@ class Storage:
         ).fetchall()
         if not rows:
             return {"error": f"No entry matching '{old_text[:50]}...'"}
-        if len(rows) > 1:
-            return {"error": f"Multiple entries match '{old_text[:50]}...', be more specific"}
-        row = rows[0]
+        row = self._pick_best_match(rows, old_text)
         conn.execute(
             "UPDATE hot_memory SET content=?, updated_at=? WHERE id=?",
             (new_content, time.time(), row["id"]),
         )
         conn.commit()
-        return {"id": row["id"], "status": "replaced"}
+        return {
+            "id": row["id"],
+            "status": "replaced",
+            "matched_count": len(rows),  # transparency: how many candidates
+        }
 
-    def hot_remove(self, target: str, old_text: str) -> dict:
+    def _hot_pop(self, target: str, old_text: str) -> dict:
+        """Internal: select+delete a hot row by LIKE match. Shared by
+        hot_remove and archive. NO soft-delete on hot tier (design §3.2:
+        hot_memory has no dream_status column)."""
         conn = self._get_conn()
         rows = conn.execute(
             "SELECT id, content FROM hot_memory WHERE target=? AND content LIKE ?",
@@ -232,10 +256,41 @@ class Storage:
         ).fetchall()
         if not rows:
             return {"error": f"No entry matching '{old_text[:50]}...'"}
-        row = rows[0]
+        row = self._pick_best_match(rows, old_text)
         conn.execute("DELETE FROM hot_memory WHERE id=?", (row["id"],))
         conn.commit()
-        return {"id": row["id"], "status": "removed", "content": row["content"]}
+        return {
+            "id": row["id"],
+            "content": row["content"],
+            "matched_count": len(rows),
+        }
+
+    def hot_remove(self, target: str, old_text: str) -> dict:
+        """F5 v0.3: hot删除 = archive→cold→mark dormant. 保留完整审计链，
+        用户后悔时走 restore 恢复到 cold(active)。"""
+        popped = self._hot_pop(target, old_text)
+        if "error" in popped:
+            return popped
+        cold = self.cold_add(
+            target=target,
+            content=popped["content"],
+            source="archived",
+            archived_from=popped["id"],
+        )
+        self._mark_dormant(
+            cold["id"],
+            actor="api",
+            reason="hot_remove",
+            source_tier="hot",
+            original_id=popped["id"],
+        )
+        return {
+            "id": popped["id"],
+            "cold_id": cold["id"],
+            "status": "removed",
+            "content": popped["content"],
+            "matched_count": popped["matched_count"],
+        }
 
     def hot_count(self, target: str) -> int:
         conn = self._get_conn()
@@ -289,7 +344,8 @@ class Storage:
 
     def cold_search(self, query: str, target: str | None = None, limit: int = 20,
                     include_consolidated: bool = False,
-                    include_dormant: bool = False) -> list[dict]:
+                    include_dormant: bool = False,
+                    origin: str | None = None) -> list[dict]:
         """Search cold memory with FTS5 fallback to LIKE.
 
         By default, rows merged into a seed by Dream (dream_status='consolidated')
@@ -310,33 +366,55 @@ class Storage:
         else:
             status_clause = ""
             like_status_clause = ""
+        # Origin filter (cm.source / source) — used to scope a search to a specific
+        # writer category, e.g. origin='session_summary' to retrieve only per-session
+        # summaries while ignoring snapshots / manual entries.
+        if origin:
+            status_clause += " AND cm.source = ?"
+            like_status_clause += " AND source = ?"
         try:
             if target:
+                params: list = [query, target]
+                if origin:
+                    params.append(origin)
+                params.append(limit)
                 rows = conn.execute(
                     f"""SELECT cm.* FROM cold_memory_fts fts
                        JOIN cold_memory cm ON cm.rowid = fts.rowid
                        WHERE cold_memory_fts MATCH ? AND cm.target = ?{status_clause}
                        ORDER BY rank LIMIT ?""",
-                    (query, target, limit),
+                    params,
                 ).fetchall()
             else:
+                params = [query]
+                if origin:
+                    params.append(origin)
+                params.append(limit)
                 rows = conn.execute(
                     f"""SELECT cm.* FROM cold_memory_fts fts
                        JOIN cold_memory cm ON cm.rowid = fts.rowid
                        WHERE cold_memory_fts MATCH ?{status_clause}
                        ORDER BY rank LIMIT ?""",
-                    (query, limit),
+                    params,
                 ).fetchall()
         except Exception:
             if target:
+                params = [f"%{query}%", target]
+                if origin:
+                    params.append(origin)
+                params.append(limit)
                 rows = conn.execute(
                     f"SELECT * FROM cold_memory WHERE content LIKE ? AND target=?{like_status_clause} LIMIT ?",
-                    (f"%{query}%", target, limit),
+                    params,
                 ).fetchall()
             else:
+                params = [f"%{query}%"]
+                if origin:
+                    params.append(origin)
+                params.append(limit)
                 rows = conn.execute(
                     f"SELECT * FROM cold_memory WHERE content LIKE ?{like_status_clause} LIMIT ?",
-                    (f"%{query}%", limit),
+                    params,
                 ).fetchall()
 
         results = []
@@ -357,14 +435,75 @@ class Storage:
         return dict(row) if row else None
 
     def cold_delete(self, memory_id: str) -> dict:
-        conn = self._get_conn()
-        row = conn.execute("SELECT id FROM cold_memory WHERE id=?", (memory_id,)).fetchone()
+        """F5 v0.3: soft-delete only. Marks the row as dormant; physical
+        deletion happens later via dream.purge_overdue_dormant().
+        """
+        row = self._get_conn().execute(
+            "SELECT id FROM cold_memory WHERE id=?", (memory_id,)
+        ).fetchone()
         if not row:
             return {"error": f"Memory {memory_id} not found"}
-        conn.execute("DELETE FROM cold_memory WHERE id=?", (memory_id,))
-        self.vec_delete(memory_id)
+        return self._mark_dormant(
+            memory_id,
+            actor="api",
+            reason="cold_delete",
+            source_tier="cold",
+        )
+
+    def _mark_dormant(self, memory_id: str, *, actor: str, reason: str,
+                      source_tier: str, original_id: str | None = None,
+                      dream_run_id: str | None = None) -> dict:
+        """F5 v0.3: unified soft-delete entry point. ALL paths that want to
+        "delete" a memory must call this. Sets dream_status='dormant', writes
+        a dream_actions audit row. Vector / FTS rows are NOT touched (FTS5
+        external-content table follows the main table; vec retained so
+        restore is cheap).
+
+        dream_run_id: caller-provided when invoked from inside a real dream
+        run (e.g. dream.forget_decay). Manual callers (user remove, API
+        delete, migration) get a synthetic run created here to satisfy
+        dream_actions' FOREIGN KEY (dream_run_id) REFERENCES dream_runs(id).
+        """
+        conn = self._get_conn()
+        now = time.time()
+        now_iso = self._iso(now)
+
+        if dream_run_id is None:
+            dream_run_id = f"manual:{uuid.uuid4().hex}"
+            conn.execute(
+                """INSERT INTO dream_runs
+                   (id, started_at, finished_at, status, config_snapshot,
+                    candidates_count, clusters_count, consolidated_count, forgotten_count)
+                   VALUES (?, ?, ?, 'manual', '{"manual":true}', 0, 0, 0, 0)""",
+                (dream_run_id, now_iso, now_iso),
+            )
+
+        conn.execute(
+            "UPDATE cold_memory SET dream_status='dormant', last_dream_at=? WHERE id=?",
+            (now_iso, memory_id),
+        )
+        conn.execute(
+            """INSERT INTO dream_actions
+               (dream_run_id, action, memory_id, details, created_at)
+               VALUES (?, 'mark_dormant', ?, ?, ?)""",
+            (dream_run_id, memory_id,
+             json.dumps({"actor": actor, "reason": reason,
+                         "source_tier": source_tier,
+                         "original_id": original_id}),
+             now_iso),
+        )
         conn.commit()
-        return {"id": memory_id, "status": "deleted"}
+        return {"id": memory_id, "status": "dormant", "dream_run_id": dream_run_id}
+
+    @staticmethod
+    def _iso(ts: float | None = None) -> str:
+        import datetime as _dt
+        if ts is None:
+            ts = time.time()
+        # ISO-8601 UTC with millisecond precision and 'Z' suffix to match
+        # SQLite's strftime('%Y-%m-%dT%H:%M:%fZ') format used in migrations.
+        d = _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc)
+        return d.strftime("%Y-%m-%dT%H:%M:%S.") + f"{d.microsecond // 1000:03d}Z"
 
     def cold_update(self, memory_id: str, content: str) -> dict:
         conn = self._get_conn()
@@ -384,16 +523,23 @@ class Storage:
             self.vec_store(memory_id, vec)
         return {"id": memory_id, "status": "updated"}
 
-    def cold_timeline(self, target: str | None = None, limit: int = 50, offset: int = 0) -> list[dict]:
+    def cold_timeline(self, target: str | None = None, limit: int = 50, offset: int = 0,
+                      include_dormant: bool = False) -> list[dict]:
         conn = self._get_conn()
+        # F5 v0.3: dormant rows hidden from default timeline. Audit UI passes
+        # include_dormant=True to surface them.
+        dormant_clause = "" if include_dormant else \
+            " AND COALESCE(dream_status, 'active') != 'dormant'"
         if target:
             rows = conn.execute(
-                "SELECT * FROM cold_memory WHERE target=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                f"SELECT * FROM cold_memory WHERE target=?{dormant_clause} "
+                "ORDER BY created_at DESC LIMIT ? OFFSET ?",
                 (target, limit, offset),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM cold_memory ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                f"SELECT * FROM cold_memory WHERE 1=1{dormant_clause} "
+                "ORDER BY created_at DESC LIMIT ? OFFSET ?",
                 (limit, offset),
             ).fetchall()
         return [dict(r) for r in rows]
@@ -402,15 +548,18 @@ class Storage:
                          agent_id: str | None = None,
                          limit: int = 50, offset: int = 0,
                          date_from: float | None = None,
-                         date_to: float | None = None) -> list[dict]:
+                         date_to: float | None = None,
+                         tag: str | None = None) -> list[dict]:
         """Combined hot+cold timeline ordered by created_at DESC.
         End-user facing — does not distinguish tiers.
         agent_id='__local__' filters to hot + cold rows where agent_id IS NULL.
         date_from/date_to are unix timestamps (inclusive lower, exclusive upper).
+        tag filters cold rows where tags JSON contains 'topic:<tag>' (hot excluded when tag set).
         """
         conn = self._get_conn()
         where_hot = ["1=1"]
-        where_cold = ["1=1"]
+        # F5 v0.3: cold side excludes dormant from default unified retrieval.
+        where_cold = ["1=1", "COALESCE(dream_status, 'active') != 'dormant'"]
         if target:
             where_hot.append("target = ?")
             where_cold.append("target = ?")
@@ -427,6 +576,10 @@ class Storage:
         if date_to is not None:
             where_hot.append("created_at < ?")
             where_cold.append("created_at < ?")
+        if tag:
+            # hot has no tags column → exclude entirely when filtering by tag
+            where_hot.append("0=1")
+            where_cold.append("tags LIKE ?")
 
         # Build params in execution order (hot params, cold params, limit, offset)
         hot_params: list = []
@@ -442,6 +595,8 @@ class Storage:
         if date_to is not None:
             hot_params.append(date_to)
             cold_params.append(date_to)
+        if tag:
+            cold_params.append(f'%"topic:{tag}"%')
 
         sql = f"""
             SELECT id, target, content, created_at, updated_at,
@@ -459,13 +614,17 @@ class Storage:
     def unified_count(self, target: str | None = None,
                       agent_id: str | None = None,
                       date_from: float | None = None,
-                      date_to: float | None = None) -> int:
+                      date_to: float | None = None,
+                      tag: str | None = None) -> int:
         """Total memories matching filters (hot+cold combined)."""
         conn = self._get_conn()
 
         def _build(table: str, is_cold: bool) -> tuple[str, list]:
             where = ["1=1"]
             params: list = []
+            if is_cold:
+                # F5 v0.3: exclude dormant from cold count (matches unified_search default)
+                where.append("COALESCE(dream_status, 'active') != 'dormant'")
             if target:
                 where.append("target = ?"); params.append(target)
             if is_cold:
@@ -481,6 +640,10 @@ class Storage:
                 where.append("created_at >= ?"); params.append(date_from)
             if date_to is not None:
                 where.append("created_at < ?"); params.append(date_to)
+            if tag:
+                if not is_cold:
+                    return "", []  # hot has no tags
+                where.append("tags LIKE ?"); params.append(f'%"topic:{tag}"%')
             return f"SELECT COUNT(*) FROM {table} WHERE {' AND '.join(where)}", params
 
         total = 0
@@ -548,17 +711,19 @@ class Storage:
     # ── Archive (hot→cold) ──
 
     def archive(self, target: str, old_text: str) -> dict:
-        removed = self.hot_remove(target, old_text)
-        if "error" in removed:
-            return removed
+        # F5 v0.3: explicit archive (hot→cold active). Uses _hot_pop directly
+        # so we don't accidentally trigger mark_dormant via hot_remove.
+        popped = self._hot_pop(target, old_text)
+        if "error" in popped:
+            return popped
         result = self.cold_add(
             target=target,
-            content=removed["content"],
+            content=popped["content"],
             source="archived",
-            archived_from=removed["id"],
+            archived_from=popped["id"],
         )
-        self._log("archive", removed["id"], {"cold_id": result["id"]})
-        return {"status": "archived", "hot_id": removed["id"], "cold_id": result["id"]}
+        self._log("archive", popped["id"], {"cold_id": result["id"]})
+        return {"status": "archived", "hot_id": popped["id"], "cold_id": result["id"]}
 
     # ── Promote (cold→hot) ──
 
@@ -567,7 +732,16 @@ class Storage:
         if not entry:
             return {"error": f"Cold memory {memory_id} not found"}
         hot = self.hot_add(entry["target"], entry["content"])
-        self.cold_delete(memory_id)
+        # F5 v0.3: cold side becomes dormant (consolidated_promoted reason)
+        # rather than hard-delete. Audit trail preserved; purge job will
+        # cleanup later.
+        self._mark_dormant(
+            memory_id,
+            actor="api",
+            reason="consolidate_promoted",
+            source_tier="cold",
+            original_id=hot["id"],
+        )
         self._log("promote", memory_id, {"hot_id": hot["id"]})
         return {"status": "promoted", "cold_id": memory_id, "hot_id": hot["id"]}
 
@@ -603,7 +777,17 @@ class Storage:
     VEC_DISTANCE_THRESHOLD = 1.0
 
     def vec_search(self, query_embedding: list[float], target: str | None = None,
-                   limit: int = 20) -> list[dict]:
+                   limit: int = 20, include_dormant: bool = False,
+                   origin: str | None = None) -> list[dict]:
+        """Pure KNN vector search.
+
+        ⚠️ Known limitation: when ``origin`` is set, filtering happens AFTER
+        KNN retrieval (sqlite-vec JOIN quirk forbids in-SQL filter). If the
+        ``fetch_k * 3`` nearest neighbours contain no rows with the target
+        source, results will be empty even when matching rows exist.
+        Workaround: use mode='hybrid' (default) — its FTS path filters
+        ``source`` directly in SQL and dominates RRF fusion.
+        """
         conn = self._get_conn()
         # sqlite-vec quirk: KNN MATCH on empty vec0 table raises "unknown error".
         # Guard with a fast count check.
@@ -612,23 +796,55 @@ class Storage:
             return []
         blob = self._serialize_vec(query_embedding)
         fetch_k = max(limit * 3, 30)
+        # NOTE: Avoid KNN MATCH — sqlite-vec v0.1.9 raises OperationalError
+        # ('unknown error') intermittently when MATCH is mixed with sqlite3.Row
+        # factory, PRAGMA setup, or JOIN. Use vec_distance_l2() + ORDER BY
+        # instead. For small tables (<10k rows) this is fast enough and robust.
         try:
-            rows = conn.execute(
-                """SELECT v.memory_id, v.distance, cm.*
-                   FROM cold_memory_vec v
-                   JOIN cold_memory cm ON cm.id = v.memory_id
-                   WHERE v.embedding MATCH ? AND k = ?""",
+            knn = conn.execute(
+                "SELECT memory_id, vec_distance_l2(embedding, ?) AS distance "
+                "FROM cold_memory_vec ORDER BY distance LIMIT ?",
                 (blob, fetch_k),
             ).fetchall()
         except sqlite3.OperationalError as e:
-            logger.warning("vec_search failed (%s); returning empty result", e)
+            import traceback
+            logger.warning("vec_search failed: %s\n%s", e, traceback.format_exc())
             return []
 
+        if not knn:
+            return []
+
+        # Build id→distance map preserving KNN order
+        ordered_ids = []
+        dist_by_id = {}
+        for r in knn:
+            mid = r["memory_id"] if isinstance(r, sqlite3.Row) else r[0]
+            dist = r["distance"] if isinstance(r, sqlite3.Row) else r[1]
+            ordered_ids.append(mid)
+            dist_by_id[mid] = dist
+
+        # Fetch full memory rows in a second query (sqlite-vec JOIN quirk).
+        placeholders = ",".join("?" * len(ordered_ids))
+        rows = conn.execute(
+            f"SELECT * FROM cold_memory WHERE id IN ({placeholders})",
+            ordered_ids,
+        ).fetchall()
+        by_id = {r["id"]: dict(r) for r in rows}
+
         results = []
-        for r in rows:
-            d = dict(r)
-            distance = d.pop("distance", None)
+        for mid in ordered_ids:  # preserve KNN ranking
+            d = by_id.get(mid)
+            if not d:
+                continue
+            distance = dist_by_id.get(mid)
             if target and d.get("target") != target:
+                continue
+            if origin and d.get("source") != origin:
+                continue
+            # F5 v0.3: dormant rows must NOT surface in retrieval unless caller
+            # explicitly opts in (audit / restore UI). Filter applies to ALL
+            # downstream callers (hybrid_search/cold_search wrap this).
+            if not include_dormant and d.get("dream_status") == "dormant":
                 continue
             if distance is not None and distance > self.VEC_DISTANCE_THRESHOLD:
                 continue
@@ -748,6 +964,29 @@ class Storage:
             (action, memory_id, __import__("json").dumps(details or {})),
         )
         conn.commit()
+
+    def topic_tags(self, min_count: int = 2, limit: int = 200) -> list[dict]:
+        """Aggregate 'topic:xxx' tags from cold_memory.tags JSON column.
+        Returns [{tag, count}] sorted desc. Excludes dormant rows.
+        """
+        import json as _json
+        from collections import Counter
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT tags FROM cold_memory "
+            "WHERE tags IS NOT NULL AND tags != '[]' "
+            "AND COALESCE(dream_status,'active') != 'dormant'"
+        ).fetchall()
+        c: Counter = Counter()
+        for r in rows:
+            try:
+                for t in _json.loads(r["tags"] if isinstance(r, dict) or hasattr(r, "keys") else r[0]):
+                    if isinstance(t, str) and t.startswith("topic:"):
+                        c[t[6:]] += 1
+            except Exception:
+                pass
+        return [{"tag": t, "count": n}
+                for t, n in c.most_common(limit) if n >= min_count]
 
     def get_logs(self, limit: int = 50) -> list[dict]:
         conn = self._get_conn()
