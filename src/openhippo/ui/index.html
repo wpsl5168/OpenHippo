@@ -67,30 +67,9 @@
   .backdrop { background: rgba(26, 26, 26, .45); backdrop-filter: blur(4px); }
   input:focus { outline: none; }
 
-  /* Timeline spine */
-  .tl-spine { position: relative; padding-left: 1.5rem; }
-  .tl-spine::before {
-    content: ''; position: absolute; left: 0.4375rem; top: 8px; bottom: 8px;
-    width: 2px; background: #e7e2d0;
-    border-radius: 2px;
-  }
+  /* Timeline spine — disabled (cards carry their own time) */
+  .tl-spine { position: relative; padding-left: 0; }
   .tl-node { position: relative; }
-  .tl-node::before {
-    content: ''; position: absolute; left: -1.0625rem; top: 1.25rem;
-    width: 14px; height: 14px; border-radius: 999px;
-    background: #c7bff5;
-    border: 3px solid #fdfcf9;
-    box-shadow: 0 0 0 1px rgba(124,110,234,.25);
-    z-index: 2;
-    transition: transform .2s ease, box-shadow .2s ease;
-  }
-  .tl-node:hover::before {
-    transform: scale(1.15);
-    box-shadow: 0 0 0 4px rgba(124,110,234,.15);
-  }
-  .tl-node.target-user::before { background: #f59e0b; box-shadow: 0 0 0 1px rgba(245,158,11,.3); }
-  .tl-node.target-user:hover::before { box-shadow: 0 0 0 4px rgba(245,158,11,.18); }
-  .tl-node.target-memory::before { background: #10b981; box-shadow: 0 0 0 1px rgba(16,185,129,.3); }
   .tl-node.target-memory:hover::before { box-shadow: 0 0 0 4px rgba(16,185,129,.18); }
 
   /* Card left-accent band */
