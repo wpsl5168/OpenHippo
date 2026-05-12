@@ -10,6 +10,8 @@
 <script src="https://cdn.tailwindcss.com"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 <script>
   tailwind.config = {
     theme: {
@@ -174,7 +176,7 @@
                   <span>·</span>
                   <span x-text="fmtDate(s.created_at)"></span>
                 </div>
-                <div class="text-sm text-ink-900 leading-snug line-clamp-2" x-html="highlight(s.content, query)"></div>
+                <div class="text-sm text-ink-900 leading-snug line-clamp-2" x-html="renderMd(s.content, query)"></div>
               </div>
             </button>
           </template>
@@ -396,11 +398,11 @@
               </div>
               <div
                 class="hippo-body whitespace-pre-wrap break-words"
-                :class="!expanded[item.id] && item.content.length > 280 ? 'content-fade' : ''"
-                x-html="highlight(item.content, committedQuery)"></div>
+                :class="!expanded[item.id] && plainLen(item.content) > 280 ? 'content-fade' : ''"
+                x-html="renderMd(item.content, committedQuery)"></div>
               <div class="mt-2 flex items-center justify-between text-xs">
                 <button
-                  x-show="item.content.length > 280"
+                  x-show="plainLen(item.content) > 280"
                   @click="expanded[item.id] = !expanded[item.id]"
                   class="text-accent-600 hover:text-accent-700 font-medium"
                   x-text="expanded[item.id] ? '收起 ↑' : '展开全文 ↓'"></button>
@@ -974,6 +976,46 @@ function hippo() {
       if (!q || q.length < 2) return escaped;
       const re = new RegExp('(' + q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
       return escaped.replace(re, '<mark class="hippo-mark">$1</mark>');
+    },
+    plainLen(text) {
+      if (!text) return 0;
+      return text.replace(/[#*`>\-_~\[\]()!]/g, '').length;
+    },
+    renderMarkdown(text) {
+      if (!text) return '';
+      const html = marked.parse(text, { gfm: true, breaks: true });
+      return DOMPurify.sanitize(html, {
+        USE_PROFILES: { html: true },
+        FORBID_TAGS: ['style', 'script', 'iframe', 'object', 'embed', 'form', 'input'],
+        FORBID_ATTR: ['style', 'onerror', 'onload', 'onclick'],
+        ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto|tel):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i,
+      });
+    },
+    applyHighlight(html, q) {
+      if (!q || q.length < 2) return html;
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = html;
+      const re = new RegExp('(' + q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
+      const walker = document.createTreeWalker(wrapper, NodeFilter.SHOW_TEXT, {
+        acceptNode: (n) => {
+          const p = n.parentNode;
+          if (p && (p.tagName === 'CODE' || p.tagName === 'PRE')) return NodeFilter.FILTER_REJECT;
+          return NodeFilter.FILTER_ACCEPT;
+        }
+      });
+      const targets = [];
+      while (walker.nextNode()) targets.push(walker.currentNode);
+      for (const node of targets) {
+        if (!re.test(node.nodeValue)) continue;
+        re.lastIndex = 0;
+        const span = document.createElement('span');
+        span.innerHTML = node.nodeValue.replace(re, '<mark class="hippo-mark">$1</mark>');
+        node.parentNode.replaceChild(span, node);
+      }
+      return wrapper.innerHTML;
+    },
+    renderMd(text, q) {
+      return this.applyHighlight(this.renderMarkdown(text), q);
     },
   };
 }
