@@ -35,6 +35,7 @@ Most agent memory solutions (Mem0, Zep, etc.) are either cloud-hosted or tightly
 - **Agent integration** — Hook/plugin system for seamless, zero-config memory sync with AI agents. Also exposes a REST API for direct access.
 - **Auditable** — Full CRUD operations on stored memories. Timeline browsing. Operation logs. Users can inspect, edit, and delete any memory.
 - **Markdown-rendered UI** — Memory content is rendered as Markdown in the web UI (lists, code blocks, tables, links), so structured notes from agents stay readable instead of collapsing into a wall of text.
+- **Source attribution** — Cold memories track `originator` (user/assistant) and `channel` (weixin/feishu/telegram/cli/discord/...), surfaced in the UI as a colored left border + channel emoji so you can tell at a glance who said what and where.
 
 ## Architecture
 
