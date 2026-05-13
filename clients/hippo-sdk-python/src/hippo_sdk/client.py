@@ -201,6 +201,8 @@ class HippoClient:
         dedup: bool = True,
         agent_id: str | None = None,
         target: str = "memory",
+        originator: str | None = None,
+        channel: str | None = None,
     ) -> bool:
         """Insert directly into cold storage (used for session snapshots)."""
         if not content or not content.strip():
@@ -219,6 +221,10 @@ class HippoClient:
             payload["metadata"] = metadata
         if session_id:
             payload["session_id"] = session_id
+        if originator:
+            payload["originator"] = originator
+        if channel:
+            payload["channel"] = channel
         return self._post_or_wal("/v1/cold/memories", payload) is not None
 
     # ── maintenance ───────────────────────────────────────────────────────

@@ -305,7 +305,9 @@ class HippoEngine:
     def cold_add(self, target: str, content: str, source: str = "manual",
                  tags: list[str] | None = None, metadata: dict | None = None,
                  agent_id: str | None = None, scope: str = "agent",
-                 session_id: str | None = None, dedup: bool = True) -> dict:
+                 session_id: str | None = None, dedup: bool = True,
+                 originator: str | None = None,
+                 channel: str | None = None) -> dict:
         """Insert directly into cold storage (e.g. session snapshots, audit records)
         without going through hot. Auto-embeds for semantic search.
 
@@ -321,6 +323,7 @@ class HippoEngine:
             target=target, content=content, source=source,
             tags=tags, metadata=metadata,
             agent_id=agent_id, scope=scope, session_id=session_id,
+            originator=originator, channel=channel,
         )
         embed_status = self._embed_or_enqueue(result["id"], content)
         result["embedding_status"] = embed_status

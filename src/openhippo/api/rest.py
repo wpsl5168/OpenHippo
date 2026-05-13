@@ -231,6 +231,8 @@ class ColdAddRequest(_StrictModel):
     session_id: str | None = None
     scope: str = Field("agent", description="'agent' or 'shared'")
     dedup: bool = Field(True, description="Skip if exact content already exists")
+    originator: str | None = Field(None, description="'user' or 'assistant'")
+    channel: str | None = Field(None, description="'weixin' | 'feishu' | 'telegram' | 'cli' | ...")
 
 
 # ── Endpoints ──
@@ -249,6 +251,7 @@ def cold_add_memory(req: ColdAddRequest):
         tags=req.tags, metadata=req.metadata,
         agent_id=req.agent_id, session_id=req.session_id, scope=req.scope,
         dedup=req.dedup,
+        originator=req.originator, channel=req.channel,
     )}
 
 @app.post("/v1/memories/search")

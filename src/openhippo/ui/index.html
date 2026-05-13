@@ -71,6 +71,9 @@
   .tl-spine { position: relative; padding-left: 0; }
   .tl-node { position: relative; }
   .tl-node.target-memory:hover::before { box-shadow: 0 0 0 4px rgba(16,185,129,.18); }
+  /* originator left border (4px solid). Default = no border / preserve previous look. */
+  .tl-node.orig-user      { border-left: 4px solid #3b82f6; }
+  .tl-node.orig-assistant { border-left: 4px solid #8b5cf6; }
 
   /* Card left-accent band — disabled for cleaner mobile layout */
 
@@ -394,11 +397,12 @@
           <template x-for="item in group.items" :key="item.id">
             <article
               :id="'mem-' + item.id"
-              :class="'tl-node target-' + item.target"
+              :class="'tl-node target-' + item.target + ' orig-' + (item.originator || 'none')"
               class="bg-white rounded-xl border border-cream-200 shadow-card hover:shadow-cardHover transition px-3 md:px-4 py-3 group">
               <div class="flex items-center gap-2 mb-1.5">
                 <span class="pill" :class="item.target === 'user' ? 'pill-user' : 'pill-memory'" x-text="targetLabel(item.target)"></span>
                 <span class="text-[11px] text-ink-500 font-mono" x-text="fmtTime(item.created_at)"></span>
+                <span x-show="item.channel" class="text-[12px] leading-none" :title="'via ' + (item.channel || '')" x-text="channelEmoji(item.channel)"></span>
                 <span x-show="item.agent_id" class="ml-auto text-[10px] font-mono px-1.5 py-0.5 bg-cream-100 text-ink-500 rounded" x-text="item.agent_id"></span>
               </div>
               <div
@@ -948,6 +952,11 @@ function hippo() {
       setTimeout(() => { if (this.notice === msg) this.notice = ''; }, 2400);
     },
     targetLabel(t) { return t === 'user' ? '关于你' : '工作笔记'; },
+    channelEmoji(ch) {
+      const map = { weixin: '💬', feishu: '📘', telegram: '✈️', cli: '💻', discord: '🎮' };
+      if (!ch) return '';
+      return map[ch] || '🔘';
+    },
     targetColor(t) { return t === 'user' ? '#d97706' : '#059669'; },
     agentColor(i) {
       const palette = ['#7c6eea', '#d97706', '#059669', '#0284c7', '#db2777', '#65a30d', '#dc2626'];

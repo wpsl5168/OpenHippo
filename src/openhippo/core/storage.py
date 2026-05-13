@@ -313,7 +313,9 @@ class Storage:
                  archived_from: str | None = None,
                  agent_id: str | None = None,
                  scope: str = "agent",
-                 session_id: str | None = None) -> dict:
+                 session_id: str | None = None,
+                 originator: str | None = None,
+                 channel: str | None = None) -> dict:
         conn = self._get_conn()
         mid = uuid.uuid4().hex[:16]
         now = time.time()
@@ -321,13 +323,15 @@ class Storage:
         conn.execute(
             """INSERT INTO cold_memory
                (id, target, content, source, tags, created_at, updated_at,
-                archived_from, metadata, content_hash, agent_id, scope, session_id)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                archived_from, metadata, content_hash, agent_id, scope, session_id,
+                originator, channel)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (mid, target, content, source,
              __import__("json").dumps(tags or []),
              now, now, archived_from,
              __import__("json").dumps(metadata or {}),
-             chash, agent_id, scope, session_id),
+             chash, agent_id, scope, session_id,
+             originator, channel),
         )
         conn.commit()
         return {"id": mid, "status": "created"}
@@ -600,11 +604,13 @@ class Storage:
 
         sql = f"""
             SELECT id, target, content, created_at, updated_at,
-                   NULL as source, NULL as agent_id, NULL as scope, NULL as session_id, 'hot' as tier
+                   NULL as source, NULL as agent_id, NULL as scope, NULL as session_id,
+                   NULL as originator, NULL as channel, 'hot' as tier
             FROM hot_memory WHERE {' AND '.join(where_hot)}
             UNION ALL
             SELECT id, target, content, created_at, updated_at,
-                   source, agent_id, scope, session_id, 'cold' as tier
+                   source, agent_id, scope, session_id,
+                   originator, channel, 'cold' as tier
             FROM cold_memory WHERE {' AND '.join(where_cold)}
             ORDER BY created_at DESC LIMIT ? OFFSET ?
         """
