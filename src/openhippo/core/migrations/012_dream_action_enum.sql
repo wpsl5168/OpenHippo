@@ -14,5 +14,5 @@ WHEN NEW.action NOT IN (
   'mark_dormant', 'restore_dormant', 'purge_dormant', 'consolidate_promoted'
 )
 BEGIN
-  SELECT RAISE(ABORT, 'invalid dream_action: ' || NEW.action);
+  SELECT RAISE(ABORT, 'invalid dream_action');
 END;

@@ -35,6 +35,10 @@ A vector's existence and a matching space label are not proof of its input revis
 - `exporter_agent_id` is header attribution only; `agent_id` is its deprecated alias. Neither filters memories nor authenticates a caller. Conflicting aliases return 400. Markdown/CSV ignore attribution.
 - Storage is local, but remote embedding sends inputs to its provider. Preinstall local dependencies/model weights for offline use. Never back up a live WAL database by copying only its main file.
 
+## SQLite portability
+
+CI exposed pre-existing migration SQL using a dynamic RAISE message unsupported by SQLite 3.45. Fresh migrations now use literal messages; migration 014 atomically replaces the three existing triggers without changing their allowed values or any memory/audit row. SQLite 3.45.1 clean-install regression passes. Upgrade an existing database on a runtime that can read its current schema before attempting to move it to an older SQLite.
+
 ## Reproducible verification
 
 ```sh
@@ -64,7 +68,7 @@ Preserve the previous service definition and source. Build/test outside the live
 For the owner's 2026-09-08 rollout the private controller is:
 
 ```sh
-python3 /home/wpsl5168/work/openhippo-closeout/2026-09-08/deploy.py rollback
+python3 /home/wpsl5168/work/openhippo-closeout/2026-09-08/ci-release/deploy.py rollback
 ```
 
 It restores the immediately previous drop-in and code, not the original repository's oldest state. It never copies an older database over new writes. Do not use the older 2026-09-07 controller after this drop-in has changed. Only the verified baseline old worker (MAX_ATTEMPTS=5) is covered by the exhausted-job rollback check.
