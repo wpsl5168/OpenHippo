@@ -10,7 +10,7 @@
 
 ---
 
-OpenHippo is an open-source, local-first memory engine designed for AI agents. It provides persistent, searchable memory with hot/cold tiering, hybrid retrieval (full-text + semantic vector search), and a clean REST API — all backed by SQLite. No cloud dependency. No vendor lock-in. Your data stays on your machine.
+OpenHippo is an open-source, local-first memory engine designed for AI agents. It provides persistent, searchable memory with hot/cold tiering, hybrid retrieval (full-text + semantic vector search), and a clean REST API — all backed by SQLite. No external database is required. Local embedding keeps memory and query text on your machine; an explicitly configured remote embedding provider receives the text sent for inference.
 
 ## The Problem
 
@@ -28,7 +28,7 @@ OpenHippo is that hippocampus for AI agents:
 Most agent memory solutions (Mem0, Zep, etc.) are either cloud-hosted or tightly coupled to a specific framework. OpenHippo takes a different approach:
 
 - **Local-first** — SQLite + [sqlite-vec](https://github.com/asg017/sqlite-vec) for storage and vector search. No external database needed.
-- **Privacy by design** — All data stays on disk. Embedding runs locally via [sentence-transformers](https://sbert.net/) or Ollama.
+- **Provider-aware privacy** — SQLite remains local. Local sentence-transformers or a locally hosted Ollama can keep inference local; remote Ollama and Copilot endpoints receive embedding inputs.
 - **Hot/cold tiering** — Frequently accessed memories stay "hot" (fast, capacity-limited); older entries archive to "cold" storage with full vector indexing.
 - **Hybrid retrieval** — Combines FTS5 full-text search with vector similarity via Reciprocal Rank Fusion (RRF).
 - **Semantic deduplication** — Prevents storing near-duplicate entries using both exact hash and vector distance checks.
@@ -160,24 +160,25 @@ storage:
   db_path: ~/.hippocampus/memory.db
 
 embedding:
-  provider: local              # "local" (sentence-transformers) or "ollama"
-  model: nomic-embed-text-v1.5
-  dimensions: 768
+  provider: local              # auto | local | ollama | copilot
+  local:
+    model: nomic-ai/nomic-embed-text-v1.5
+    device: cpu
 
   ollama:
     base_url: http://localhost:11434
 
 server:
-  host: 0.0.0.0
+  host: 127.0.0.1
   port: 8200
 ```
 
-Every config value can be overridden via environment variables:
+Supported overrides are listed in `src/openhippo/core/config.py:ENV_MAP`. For example:
 
 ```bash
 HIPPO_EMBEDDING_PROVIDER=ollama  # Switch to Ollama backend
 HIPPO_DB_PATH=/data/memory.db    # Custom database path
-HIPPO_SERVER_PORT=9000           # Custom port
+HIPPO_PORT=9000           # Custom port
 ```
 
 ## Embedding Backends
@@ -187,7 +188,9 @@ HIPPO_SERVER_PORT=9000           # Custom port
 | **sentence-transformers** (default) | `pip install -e ".[local]"` | No (CPU OK) | ~80 MB | Zero external dependencies |
 | **Ollama** | [ollama.com](https://ollama.com) | No | ~270 MB | Shared with other Ollama models |
 
-Both backends use `nomic-embed-text-v1.5` (768 dimensions) by default for consistent vector quality.
+`auto` probes the configured Ollama endpoint before trying sentence-transformers. Select a provider explicitly for reproducible deployments. The local defaults use nomic models and 768 dimensions, but equal dimensions do not prove equal embedding spaces.
+
+An optional `copilot` provider uses the configured account and `text-embedding-3-small` at 768 dimensions. It requires an authorized account and sends input text to the remote service. It is not part of offline tests. Legacy `openai` configuration keys are not an implemented provider selection.
 
 > **Note on long content (Ollama backend):** `nomic-embed-text` has a 2048-token context window. Inputs over ~1800 chars (especially CJK text, where one character ≈ 2-3 tokens) trigger HTTP 500 from Ollama. `OllamaProvider` automatically truncates prompts to `MAX_PROMPT_CHARS=1800` and falls back through `[1800 → 1200 → 800 → 400]` chars on 500 errors, so long memories embed cleanly without manual chunking. If you need the full content searchable as multiple vectors, split it into chunks before calling `add_memory`.
 
@@ -219,7 +222,7 @@ export HIPPO_BASE_URL=http://localhost:8200
 
 ## Remote Access (Advanced)
 
-OpenHippo is **local-first**. By default it binds to `127.0.0.1` and ships with **no authentication** — your memories never leave the loopback interface.
+OpenHippo is **local-first**. The CLI binds to `127.0.0.1` by default and the API ships with **no authentication**. This restricts inbound access only; remote embedding still sends input text to the configured provider. A custom service may bind a different address.
 
 If you want to access OpenHippo from another machine (e.g. your phone, a remote agent), **do not just `--host 0.0.0.0`**. Put a reverse proxy with proper authentication in front. Recommended patterns:
 
@@ -244,14 +247,18 @@ Then in Cloudflare Zero Trust → Access → Applications, add a Self-hosted app
 
 > ⚠️ **Without auth in front, anyone on the network can read, edit, and delete every memory in your database.** OpenHippo intentionally does not implement auth itself — battle-tested reverse proxies do it better.
 
+## Export attribution and backup scope
+
+Release **0.4.1** uses JSON/JSONL backup schema **1.1** (separate version numbers). `GET /v1/export` filters by `target`, `since`, `until` and `tags`; **`exporter_agent_id` only annotates the JSON/JSONL header**. The old `agent_id` parameter is a deprecated alias, not a record filter or authenticated principal. Conflicting aliases return HTTP 400. Markdown/CSV ignore attribution and are human-readable views, not full-fidelity backups. Never expose this endpoint as a tenant-isolated export without a separately designed authorization boundary.
+
 ## Development
 
 ```bash
 # Install dev dependencies
-pip install -e ".[local,dev]"
+pip install -e ".[dev]"
 
-# Run tests
-pytest -v
+# Run offline synthetic tests (temporary HOME, TCP denied, no model download)
+python scripts/run_offline_tests.py
 
 # Lint
 ruff check src/
@@ -263,19 +270,19 @@ mypy src/
 ## FAQ: Why local-first?
 
 **Q: Why not use a hosted memory service like Mem0 or Zep?**
-Local-first means your conversations and memories never leave your machine. No third-party retains a copy, no vendor lock-in, no surprise pricing or shutdown. You own the SQLite file — back it up, move it, delete it, fork the schema. Hosted services optimize for their own retention; OpenHippo optimizes for yours.
+Local-first means you own the SQLite store and can use local inference without an external database. It does not guarantee zero egress: remote embedding sends memory/query text to its provider, whose retention and billing policies apply. Choose a local provider explicitly for offline deployments.
 
 **Q: Is SQLite really fast enough for memory storage?**
-Yes, for the realistic load. With WAL mode and `sqlite-vec` for ANN search, a single SQLite file comfortably handles hundreds of thousands of memories with sub-50ms hybrid queries on commodity hardware. Most agents accumulate thousands, not billions, of memories — Postgres or a vector DB is overkill until you actually hit that scale.
+Measure your corpus and configured provider. OpenHippo uses SQLite WAL, FTS5 and sqlite-vec exact vector search; latency includes embedding, filtering and optional access accounting. There is no universal sub-50ms or corpus-size guarantee. Keep the existing database until measured load justifies a migration.
 
 **Q: How do I integrate OpenHippo with my existing agent?**
-Two paths, pick whichever fits. The hook/plugin route auto-captures conversations from supported agent frameworks with zero glue code (see [Agent Integration (Hook/Plugin)](#agent-integration-hookplugin)). The REST API route gives you full CRUD over `/v1/memories` and search via `/v1/search` — works with any language or framework that speaks HTTP.
+Two paths, pick whichever fits. The hook/plugin route auto-captures conversations from supported agent frameworks with zero glue code (see [Agent Integration (Hook/Plugin)](#agent-integration-hookplugin)). The REST API route gives you full CRUD over `/v1/memories` and search via `/v1/memories/search` — works with any language or framework that speaks HTTP.
 
 **Q: How do I back up my memories?**
-The entire store is one SQLite file (`hippocampus.db` by default). Copy it with `cp`, sync with `rsync`, version it with `git`, snapshot it with your filesystem — any tool that handles a single file works. No dump/restore tooling, no migrations, no proprietary export format.
+The default database is `~/.hippocampus/memory.db`. While the service runs, use SQLite backup API or a coordinated filesystem snapshot: copying only the live `.db` file can omit committed WAL data. Restore to a separate path and verify integrity before any cutover. JSON/JSONL 1.1 preserve memory fields, vectors and space metadata; they do not include every queue/Dream audit table. See [data-safe release and rollback](docs/data-safety-release.md). Never overwrite newer production data with an older backup.
 
 **Q: Can I run completely offline (no network)?**
-Yes. Use the local `sentence-transformers` embedding backend or a local Ollama instance and OpenHippo never makes an outbound call. The SQLite store, FTS5 search, vector search, and Dream consolidation all run entirely in-process. Air-gapped deployments work out of the box.
+Yes, after dependencies and model files have been provisioned locally. Select `local` or an Ollama endpoint on loopback; downloading model weights initially needs network access. Local inference and SQLite work offline. The browser UI currently loads third-party CDN assets, so an air-gapped UI also needs locally vendored assets.
 
 **Q: How is this project developed?**
 Dev/QA/Ship three-stage workflow via the `hermes-team` wrapper — a developer agent writes the code, a QA agent reviews it, and a ship agent merges to main and cleans up branches. See `~/.hermes/skills/devops/team-sop` for the full SOP.
@@ -292,13 +299,13 @@ Dev/QA/Ship three-stage workflow via the `hermes-team` wrapper — a developer a
 - [x] Audit log and memory timeline
 - [x] Pluggable embedding backends (local / Ollama)
 - [x] Unified YAML + env config system
-- [x] Bearer token authentication
+- [x] Remote-access guidance (authentication belongs to the trusted proxy; no built-in API auth)
 - [x] Docker image and compose deployment
 - [x] Remote agent connection (multi-VM support)
 - [x] F5 Dream — sleep-inspired memory consolidation (cluster + consolidate + soft forget + restore)
 - [x] Auto-scheduler with metrics observability (`/v1/dream/metrics`)
 - [ ] Multi-tenant support
-- [ ] Web UI for memory inspection
+- [x] Web UI for memory inspection
 - [ ] Webhook / event-driven memory triggers
 
 ## License

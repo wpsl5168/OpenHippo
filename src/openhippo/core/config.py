@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 from pathlib import Path
@@ -35,7 +36,7 @@ DEFAULTS: dict[str, Any] = {
         "db_path": str(DEFAULT_DATA_DIR / "memory.db"),
     },
     "embedding": {
-        "provider": "auto",  # auto | ollama | local | openai
+        "provider": "auto",  # auto | ollama | local | copilot
         "ollama": {
             "base_url": "http://127.0.0.1:11434",
             "model": "nomic-embed-text",
@@ -98,7 +99,7 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
     
     Priority (highest wins): env vars > config file > defaults.
     """
-    config = DEFAULTS.copy()
+    config = copy.deepcopy(DEFAULTS)
 
     # Load YAML if exists
     path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH

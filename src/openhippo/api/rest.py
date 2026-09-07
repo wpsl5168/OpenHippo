@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+from .. import __version__
 from ..core.engine import HippoEngine
 from ..core import embed_queue
 
@@ -155,7 +156,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="OpenHippo",
     description="🦛 Local-first memory engine for AI Agents",
-    version="0.3.0",
+    version=__version__,
     lifespan=lifespan,
 )
 
@@ -422,10 +423,10 @@ def health():
         cold_size = conn.execute("SELECT COUNT(*) FROM cold_memory").fetchone()[0]
         hot_size = conn.execute("SELECT COUNT(*) FROM hot_memory").fetchone()[0]
     except Exception as e:
-        return {"status": "degraded", "version": "0.3.0", "error": str(e)}
+        return {"status": "degraded", "version": __version__, "error": str(e)}
     return {
         "status": "ok",
-        "version": "0.3.0",
+        "version": __version__,
         "metrics": {
             "hot_entries": hot_size,
             "cold_entries": cold_size,
@@ -440,19 +441,26 @@ def health():
 def export_memories(
     format: str = "json",
     target: str | None = None,
-    agent_id: str | None = None,
+    agent_id: str | None = Query(None, deprecated=True, description="Legacy exporter annotation, NOT a filter or authenticated identity."),
     since: float | None = None,
     until: float | None = None,
     tags: str | None = None,
     include_embeddings: bool = True,
+    exporter_agent_id: str | None = Query(None, description="Export attribution only; never filters records or grants authorization. JSON/JSONL header only."),
 ):
     """Export all memories as JSON, JSONL, Markdown, or CSV.
     
-    One-click full export with schema versioning for zero-lock-in portability.
+    Only target/since/until/tags filter records. exporter_agent_id (legacy
+    alias agent_id) labels JSON/JSONL headers only; Markdown/CSV ignore it.
+    Neither parameter is an authorization boundary. Remote access must be
+    authenticated by a separately configured trusted proxy.
     """
     import io
     from ..core.export import export_json, export_markdown, export_csv
 
+    if agent_id is not None and exporter_agent_id is not None and agent_id != exporter_agent_id:
+        raise HTTPException(400, "Conflicting exporter annotations")
+    annotation = exporter_agent_id if exporter_agent_id is not None else agent_id
     e = _engine()
     tag_list = [t.strip() for t in tags.split(",")] if tags else None
 
@@ -460,7 +468,7 @@ def export_memories(
         content = export_json(
             e.storage, target=target, since=since, until=until,
             tags=tag_list, include_embeddings=include_embeddings,
-            agent_id=agent_id,
+            agent_id=annotation,
         )
         return StreamingResponse(
             iter([content]),
@@ -472,7 +480,7 @@ def export_memories(
         export_json(
             e.storage, output=buf, target=target, since=since, until=until,
             tags=tag_list, include_embeddings=include_embeddings,
-            agent_id=agent_id, jsonlines=True,
+            agent_id=annotation, jsonlines=True,
         )
         return StreamingResponse(
             iter([buf.getvalue()]),

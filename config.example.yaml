@@ -9,7 +9,7 @@ storage:
   db_path: "~/.hippocampus/memory.db"
 
 embedding:
-  provider: "auto"     # auto | ollama | local | openai
+  provider: "auto"     # auto | ollama | local | copilot
   ollama:
     base_url: "http://127.0.0.1:11434"
     model: "nomic-embed-text"

@@ -69,7 +69,8 @@ END;
 CREATE TRIGGER IF NOT EXISTS cold_memory_ad AFTER DELETE ON cold_memory BEGIN
     INSERT INTO cold_memory_fts(cold_memory_fts, rowid, content, tags) VALUES('delete', old.rowid, old.content, old.tags);
 END;
-CREATE TRIGGER IF NOT EXISTS cold_memory_au AFTER UPDATE ON cold_memory BEGIN
+CREATE TRIGGER IF NOT EXISTS cold_memory_au AFTER UPDATE OF content, tags ON cold_memory
+WHEN old.content IS NOT new.content OR old.tags IS NOT new.tags BEGIN
     INSERT INTO cold_memory_fts(cold_memory_fts, rowid, content, tags) VALUES('delete', old.rowid, old.content, old.tags);
     INSERT INTO cold_memory_fts(rowid, content, tags) VALUES (new.rowid, new.content, new.tags);
 END;
@@ -192,6 +193,19 @@ class Storage:
         conn.executescript(VECTOR_TABLE_SQL)
         conn.commit()
         applied = run_migrations(conn)
+        # CREATE IF NOT EXISTS alone leaves the old broad UPDATE trigger in
+        # existing databases. Replace it atomically; do NOT rebuild the index.
+        with atomic(conn):
+            conn.execute("DROP TRIGGER IF EXISTS cold_memory_au")
+            conn.execute("""
+                CREATE TRIGGER cold_memory_au AFTER UPDATE OF content, tags ON cold_memory
+                WHEN old.content IS NOT new.content OR old.tags IS NOT new.tags BEGIN
+                    INSERT INTO cold_memory_fts(cold_memory_fts, rowid, content, tags)
+                        VALUES('delete', old.rowid, old.content, old.tags);
+                    INSERT INTO cold_memory_fts(rowid, content, tags)
+                        VALUES (new.rowid, new.content, new.tags);
+                END
+            """)
         # Additive safety metadata only. Existing model labels/vectors are NEVER
         # reclassified. Legacy rows without evidence remain unavailable to KNN.
         conn.executescript("""
@@ -401,7 +415,7 @@ class Storage:
     def cold_search(self, query: str, target: str | None = None, limit: int = 20,
                     include_consolidated: bool = False,
                     include_dormant: bool = False,
-                    origin: str | None = None) -> list[dict]:
+                    origin: str | None = None, *, record_access: bool = True) -> list[dict]:
         """Search cold memory with FTS5 fallback to LIKE.
 
         By default, rows merged into a seed by Dream (dream_status='consolidated')
@@ -473,17 +487,47 @@ class Storage:
                     params,
                 ).fetchall()
 
-        results = []
-        for r in rows:
-            d = dict(r)
-            conn.execute(
-                "UPDATE cold_memory SET access_count=access_count+1, last_accessed=? WHERE id=?",
-                (time.time(), d["id"]),
-            )
-            results.append(d)
-        if results:
-            conn.commit()
+        results = [dict(r) for r in rows]
+        if record_access:
+            self.record_access(r["id"] for r in results)
         return results
+
+    def record_access(self, memory_ids) -> None:
+        """Best-effort telemetry for final results, once per distinct ID.
+
+        Never join or commit a caller's transaction, nor wait for a writer.
+        Skipping statistics during contention/transactions is intentional:
+        successful retrieval must not depend on acquiring a write lock.
+        """
+        ids = list(dict.fromkeys(memory_ids))
+        if not ids:
+            return
+        conn = self._get_conn()
+        if conn.in_transaction:
+            return
+        timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        try:
+            conn.execute("PRAGMA busy_timeout=0")
+            with atomic(conn):
+                now = time.time()
+                # One UPDATE per bounded chunk, all chunks in one transaction.
+                variable_limit = (conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+                                  if hasattr(conn, "getlimit") else 999)  # Python 3.10
+                batch_size = min(500, variable_limit - 1)
+                if batch_size < 1:
+                    return
+                for start in range(0, len(ids), batch_size):
+                    batch = ids[start:start + batch_size]
+                    marks = ",".join("?" for _ in batch)
+                    conn.execute(
+                        "UPDATE cold_memory SET access_count=access_count+1, last_accessed=? "
+                        f"WHERE id IN ({marks})", (now, *batch),
+                    )
+        except sqlite3.Error as exc:
+            # Do not log memory IDs, content, or expanded SQL.
+            logger.debug("Access statistics skipped (%s)", type(exc).__name__)
+        finally:
+            conn.execute(f"PRAGMA busy_timeout={timeout}")
 
     def cold_get(self, memory_id: str) -> dict | None:
         conn = self._get_conn()
@@ -579,11 +623,14 @@ class Storage:
                 (content, _content_hash(content), version, memory_id),
             )
             self.vec_store(memory_id, vec)
-            # Invalidate even same-text/ABA jobs in the SAME commit as the new vec.
+            # Invalidate pending/running same-text/ABA jobs in the SAME commit
+            # as the new vec, so a late completion cannot overwrite it. Preserve
+            # historical failed rows field-for-field; reconciliation is additive
+            # audit evidence, not permission to erase their status/error/attempts.
             conn.execute(
                 "UPDATE embedding_jobs SET status='done', last_error='superseded by cold_update', "
                 "updated_at=datetime('now') WHERE target_table='cold_memory' AND target_id=? "
-                "AND status != 'done'", (memory_id,),
+                "AND status IN ('pending', 'running')", (memory_id,),
             )
         return {"id": memory_id, "status": "updated"}
 
@@ -966,7 +1013,9 @@ class Storage:
     def vec_search(self, query_embedding: list[float], target: str | None = None,
                    limit: int = 20, include_dormant: bool = False,
                    origin: str | None = None, *, model: str | None = None,
-                   space_id: str | None = None) -> list[dict]:
+                   space_id: str | None = None, scope: str | None = None,
+                   agent_id: str | None = None,
+                   include_consolidated: bool = False) -> list[dict]:
         # Gate and retrieval share one read snapshot; a concurrent writer cannot
         # change the corpus between the compatibility check and distance scan.
         self._serialize_vec(query_embedding)
@@ -975,88 +1024,122 @@ class Storage:
             model, space_id = self._vector_identity(query_embedding, model, space_id)
             with atomic(conn, write=False):
                 self._check_vector_space(conn, model, space_id)
-                return self._vec_search_checked(query_embedding, target, limit, include_dormant, origin)
+                return self._vec_search_checked(
+                    query_embedding, target, limit, include_dormant, origin,
+                    scope=scope, agent_id=agent_id, include_consolidated=include_consolidated,
+                )
         except VectorSpaceError as exc:
             logger.warning("Vector search disabled: %s", exc)
             return []
 
     def _vec_search_checked(self, query_embedding: list[float], target: str | None = None,
                             limit: int = 20, include_dormant: bool = False,
-                            origin: str | None = None) -> list[dict]:
-        """Pure KNN vector search.
+                            origin: str | None = None, *, scope: str | None = None,
+                            agent_id: str | None = None,
+                            include_consolidated: bool = False) -> list[dict]:
+        """Exact filtered L2 search, with a bounded KNN fast path.
 
-        ⚠️ Known limitation: when ``origin`` is set, filtering happens AFTER
-        KNN retrieval (sqlite-vec JOIN quirk forbids in-SQL filter). If the
-        ``fetch_k * 3`` nearest neighbours contain no rows with the target
-        source, results will be empty even when matching rows exist.
-        Workaround: use mode='hybrid' (default) — its FTS path filters
-        ``source`` directly in SQL and dominates RRF fusion.
+        KNN prefixes expand until exhaustion or a strictly farther boundary
+        proves that no eligible nearer/tied hit is hidden. If vec0's 4096 ceiling
+        prevents that proof, use the exact scalar fallback, never truncate recall.
+        The fallback filters metadata before LIMIT, computes each distance once,
+        and sorts IDs/distances only. Threshold pruning of the sorted prefix
+        cannot hide a nearer eligible hit. Full rows are fetched only for final
+        hits, inside vec_search's existing read snapshot.
+
+        scope is an optional exact metadata filter, NOT an ACL. Omitted filters
+        retain the existing cross-scope search contract; no implicit global or
+        shared visibility rules are introduced. agent_id uses timeline's exact
+        match / '__local__' (NULL) convention. This primitive remains read-only
+        for dedup and maintenance callers; the engine counts final search hits.
         """
+        if limit <= 0:
+            return []
         conn = self._get_conn()
-        # sqlite-vec quirk: KNN MATCH on empty vec0 table raises "unknown error".
-        # Guard with a fast count check.
-        cnt = conn.execute("SELECT COUNT(*) FROM cold_memory_vec").fetchone()[0]
-        if cnt == 0:
-            return []
-        blob = self._serialize_vec(query_embedding)
-        fetch_k = max(limit * 3, 30)
-        # NOTE: Avoid KNN MATCH — sqlite-vec v0.1.9 raises OperationalError
-        # ('unknown error') intermittently when MATCH is mixed with sqlite3.Row
-        # factory, PRAGMA setup, or JOIN. Use vec_distance_l2() + ORDER BY
-        # instead. For small tables (<10k rows) this is fast enough and robust.
-        try:
-            knn = conn.execute(
-                "SELECT memory_id, vec_distance_l2(embedding, ?) AS distance "
-                "FROM cold_memory_vec ORDER BY distance LIMIT ?",
-                (blob, fetch_k),
+        clauses = []
+        params: list[Any] = [self._serialize_vec(query_embedding)]
+        for column, value in (("target", target), ("source", origin), ("scope", scope)):
+            if value:
+                clauses.append(f"cm.{column} = ?")
+                params.append(value)
+        if agent_id == "__local__":
+            clauses.append("cm.agent_id IS NULL")
+        elif agent_id:
+            clauses.append("cm.agent_id = ?")
+            params.append(agent_id)
+        if not include_dormant:
+            clauses.append("COALESCE(cm.dream_status, 'active') != 'dormant'")
+        if not include_consolidated:
+            clauses.append("COALESCE(cm.dream_status, 'active') != 'consolidated'")
+        filter_sql = ' AND '.join(clauses) if clauses else '1'
+        rows = None
+        if limit <= 4096:
+            window = min(4096, max(32, limit + 1))
+            while True:
+                try:
+                    neighbors = conn.execute(
+                        "SELECT memory_id, distance FROM cold_memory_vec "
+                        "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                        (params[0], window),
+                    ).fetchall()
+                except sqlite3.OperationalError as exc:
+                    # Some vec0 builds/connection states reject MATCH. Retain
+                    # the complete scalar path rather than failing a read or
+                    # returning a partial prefix. Scalar failures still surface.
+                    logger.debug("KNN fast path unavailable (%s)", type(exc).__name__)
+                    break
+                candidates = [row for row in neighbors
+                              if row["distance"] <= self.VEC_DISTANCE_THRESHOLD]
+                eligible = set()
+                for start in range(0, len(candidates), 500):
+                    ids = [row["memory_id"] for row in candidates[start:start + 500]]
+                    placeholders = ",".join("?" for _ in ids)
+                    eligible.update(row["id"] for row in conn.execute(
+                        "SELECT cm.id FROM cold_memory cm "
+                        f"WHERE cm.id IN ({placeholders}) AND {filter_sql}",
+                        [*ids, *params[1:]],
+                    ))
+                prefix = sorted(
+                    ({"id": row["memory_id"], "vec_distance": row["distance"]}
+                     for row in candidates if row["memory_id"] in eligible),
+                    key=lambda row: (row["vec_distance"], row["id"]),
+                )
+                # Strict > is essential: vec0 can omit lexically earlier IDs
+                # at a tied KNN boundary, even when enough eligible hits exist.
+                if (len(neighbors) < window
+                        or neighbors[-1]["distance"] > self.VEC_DISTANCE_THRESHOLD
+                        or (len(prefix) >= limit
+                            and neighbors[-1]["distance"] > prefix[limit - 1]["vec_distance"])):
+                    rows = prefix[:limit]
+                    break
+                if window == 4096:
+                    break
+                window = min(4096, window * 2)
+        if rows is None:
+            # CROSS JOIN fixes vec0 first: reverse virtual-table ID lookups can
+            # be quadratic. Metadata filters precede the exact scalar LIMIT.
+            rows = conn.execute(
+                "SELECT cm.id, vec_distance_l2(v.embedding, ?) AS vec_distance "
+                "FROM cold_memory_vec v CROSS JOIN cold_memory cm ON cm.id = v.memory_id "
+                f"WHERE {filter_sql} ORDER BY vec_distance, cm.id LIMIT ?",
+                [*params, limit],
             ).fetchall()
-        except sqlite3.OperationalError as e:
-            import traceback
-            logger.warning("vec_search failed: %s\n%s", e, traceback.format_exc())
-            return []
-
-        if not knn:
-            return []
-
-        # Build id→distance map preserving KNN order
-        ordered_ids = []
-        dist_by_id = {}
-        for r in knn:
-            mid = r["memory_id"] if isinstance(r, sqlite3.Row) else r[0]
-            dist = r["distance"] if isinstance(r, sqlite3.Row) else r[1]
-            ordered_ids.append(mid)
-            dist_by_id[mid] = dist
-
-        # Fetch full memory rows in a second query (sqlite-vec JOIN quirk).
-        placeholders = ",".join("?" * len(ordered_ids))
-        rows = conn.execute(
-            f"SELECT * FROM cold_memory WHERE id IN ({placeholders})",
-            ordered_ids,
-        ).fetchall()
-        by_id = {r["id"]: dict(r) for r in rows}
-
-        results = []
-        for mid in ordered_ids:  # preserve KNN ranking
-            d = by_id.get(mid)
-            if not d:
-                continue
-            distance = dist_by_id.get(mid)
-            if target and d.get("target") != target:
-                continue
-            if origin and d.get("source") != origin:
-                continue
-            # F5 v0.3: dormant rows must NOT surface in retrieval unless caller
-            # explicitly opts in (audit / restore UI). Filter applies to ALL
-            # downstream callers (hybrid_search/cold_search wrap this).
-            if not include_dormant and d.get("dream_status") == "dormant":
-                continue
-            if distance is not None and distance > self.VEC_DISTANCE_THRESHOLD:
-                continue
-            d["vec_distance"] = distance
-            results.append(d)
-            if len(results) >= limit:
-                break
-        return results
+        hits = [row for row in rows
+                if row["vec_distance"] is not None
+                and row["vec_distance"] <= self.VEC_DISTANCE_THRESHOLD]
+        # Stay below SQLite's historical 999-variable limit, including when the
+        # caller requests more than vec0 KNN's 4096-result ceiling. IN does not
+        # preserve distance order, so reassemble using the sorted hit sequence.
+        by_id = {}
+        for start in range(0, len(hits), 500):
+            ids = [row["id"] for row in hits[start:start + 500]]
+            placeholders = ",".join("?" for _ in ids)
+            for row in conn.execute(
+                f"SELECT * FROM cold_memory WHERE id IN ({placeholders})", ids
+            ):
+                by_id[row["id"]] = dict(row)
+        return [dict(by_id[row["id"]], vec_distance=row["vec_distance"])
+                for row in hits]
 
     def vec_count(self) -> int:
         conn = self._get_conn()

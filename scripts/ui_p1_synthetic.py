@@ -81,7 +81,7 @@ def test_config_debug_omits_values(caplog, tmp_path):
     env = dict(os=types.SimpleNamespace(environ={"HIPPO_OPENAI_API_KEY": synthetic_key,
                                                "HIPPO_OPENAI_MODEL": "synthetic-model",
                                                "HIPPO_PORT": "18200"}),
-               Path=Path, logger=logger, ENV_MAP=env_map, DEFAULTS={}, DEFAULT_CONFIG_PATH=absent)
+               copy=__import__("copy"), Path=Path, logger=logger, ENV_MAP=env_map, DEFAULTS={}, DEFAULT_CONFIG_PATH=absent)
     load_functions("src/openhippo/core/config.py", {"_deep_merge", "_set_nested", "load_config"}, env)
     with caplog.at_level(logging.DEBUG, logger=logger.name):
         config = env["load_config"](absent)

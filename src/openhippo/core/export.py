@@ -51,7 +51,9 @@ def _build_header(storage: Storage, agent_id: str | None = None,
         "embedding_space_status": "unverified",
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "total_hot": hot, "total_cold": cold, "total_count": hot + cold,
-        "agent_id": agent_id,  # exporter annotation; NOT a filter/principal
+        "agent_id": agent_id,  # legacy alias; NOT a filter/principal
+        "exporter_agent_id": agent_id,
+        "agent_id_semantics": "exporter_annotation_not_filter",
         "include_embeddings": include_embeddings,
     }
 

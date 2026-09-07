@@ -236,7 +236,9 @@ class HippoEngine:
         if not vec:
             logger.warning("Embedding failed, falling back to FTS")
             return self.storage.cold_search(query, target, limit, origin=origin)
-        return self.storage.vec_search(vec, target, limit, origin=origin)
+        results = self.storage.vec_search(vec, target, limit, origin=origin)
+        self.storage.record_access(r["id"] for r in results)
+        return results
 
     def _hybrid_search(self, query: str, target: str | None, limit: int,
                        rrf_k: int = 60, origin: str | None = None) -> list[dict]:
@@ -244,8 +246,11 @@ class HippoEngine:
         
         Score = Σ 1/(k + rank_i) for each retrieval path.
         """
-        # FTS path
-        fts_results = self.storage.cold_search(query, target, limit, origin=origin)
+        if limit <= 0:
+            return []
+        # Candidate retrieval must not count rows discarded by RRF, or count
+        # the same memory twice when both retrieval paths find it.
+        fts_results = self.storage.cold_search(query, target, limit, origin=origin, record_access=False)
 
         # Vector path
         vec = get_embedding(query)
@@ -253,6 +258,7 @@ class HippoEngine:
 
         if not vec_results:
             # No embeddings available, return FTS only
+            self.storage.record_access(r["id"] for r in fts_results)
             return fts_results
 
         # RRF fusion
@@ -277,6 +283,7 @@ class HippoEngine:
             entry = entries[mid]
             entry["rrf_score"] = round(score, 6)
             result.append(entry)
+        self.storage.record_access(r["id"] for r in result)
         return result
 
     # ── F3: Memory Replace ──
