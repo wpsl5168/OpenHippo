@@ -1,0 +1,43 @@
+name: Offline regression
+
+on:
+  push:
+    branches: [main, 'fix/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: offline-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install package and declared test dependencies
+        run: python -m pip install -e '.[dev]'
+      - name: Verify installed dependency graph
+        run: python -m pip check
+      - name: Offline synthetic regression
+        env:
+          OPENHIPPO_TEST_RESULT: offline-test-result.json
+        run: python scripts/run_offline_tests.py
+      - name: Configuration log regression
+        run: python -m pytest --noconftest -q -p no:cacheprovider scripts/ui_p1_synthetic.py
+      - name: Retain synthetic test result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-test-result
+          path: offline-test-result.json
+          if-no-files-found: warn
+          retention-days: 7

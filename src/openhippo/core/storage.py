@@ -9,17 +9,20 @@ Threading model:
 import hashlib
 import json
 import logging
+import math
 import sqlite3
 import struct
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Optional
 
 import sqlite_vec
 
 from .migrations_runner import run_migrations
+from .embedding import validate_vector
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +69,8 @@ END;
 CREATE TRIGGER IF NOT EXISTS cold_memory_ad AFTER DELETE ON cold_memory BEGIN
     INSERT INTO cold_memory_fts(cold_memory_fts, rowid, content, tags) VALUES('delete', old.rowid, old.content, old.tags);
 END;
-CREATE TRIGGER IF NOT EXISTS cold_memory_au AFTER UPDATE ON cold_memory BEGIN
+CREATE TRIGGER IF NOT EXISTS cold_memory_au AFTER UPDATE OF content, tags ON cold_memory
+WHEN old.content IS NOT new.content OR old.tags IS NOT new.tags BEGIN
     INSERT INTO cold_memory_fts(cold_memory_fts, rowid, content, tags) VALUES('delete', old.rowid, old.content, old.tags);
     INSERT INTO cold_memory_fts(rowid, content, tags) VALUES (new.rowid, new.content, new.tags);
 END;
@@ -115,6 +119,28 @@ def _normalize_content(s: str) -> str:
 
 def _content_hash(content: str) -> str:
     return hashlib.sha256(_normalize_content(content).encode()).hexdigest()
+
+
+@contextmanager
+def atomic(conn, *, write=True):
+    """Own only our transaction/savepoint; never commit a caller's work."""
+    nested = conn.in_transaction
+    name = "vector_" + uuid.uuid4().hex
+    conn.execute(f"SAVEPOINT {name}" if nested else ("BEGIN IMMEDIATE" if write else "BEGIN"))
+    try:
+        yield
+        conn.execute(f"RELEASE {name}" if nested else "COMMIT")
+    except BaseException:
+        if nested:
+            conn.execute(f"ROLLBACK TO {name}")
+            conn.execute(f"RELEASE {name}")
+        else:
+            conn.rollback()
+        raise
+
+
+class VectorSpaceError(ValueError):
+    """Unknown or incompatible provenance: do not infer compatibility."""
 
 
 class Storage:
@@ -167,6 +193,46 @@ class Storage:
         conn.executescript(VECTOR_TABLE_SQL)
         conn.commit()
         applied = run_migrations(conn)
+        # CREATE IF NOT EXISTS alone leaves the old broad UPDATE trigger in
+        # existing databases. Replace it atomically; do NOT rebuild the index.
+        with atomic(conn):
+            conn.execute("DROP TRIGGER IF EXISTS cold_memory_au")
+            conn.execute("""
+                CREATE TRIGGER cold_memory_au AFTER UPDATE OF content, tags ON cold_memory
+                WHEN old.content IS NOT new.content OR old.tags IS NOT new.tags BEGIN
+                    INSERT INTO cold_memory_fts(cold_memory_fts, rowid, content, tags)
+                        VALUES('delete', old.rowid, old.content, old.tags);
+                    INSERT INTO cold_memory_fts(rowid, content, tags)
+                        VALUES (new.rowid, new.content, new.tags);
+                END
+            """)
+        # Additive safety metadata only. Existing model labels/vectors are NEVER
+        # reclassified. Legacy rows without evidence remain unavailable to KNN.
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS embedding_spaces (
+                memory_id TEXT PRIMARY KEY REFERENCES cold_embeddings(memory_id) ON DELETE CASCADE,
+                space_id TEXT NOT NULL,
+                model TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_embedding_spaces_identity
+                ON embedding_spaces(model, space_id, memory_id);
+            CREATE INDEX IF NOT EXISTS idx_cold_embeddings_identity
+                ON cold_embeddings(model, memory_id);
+            CREATE TABLE IF NOT EXISTS embedding_space_adoptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model TEXT NOT NULL,
+                space_id TEXT NOT NULL,
+                evidence TEXT NOT NULL CHECK(length(trim(evidence)) > 0),
+                created_at REAL NOT NULL,
+                validated_count INTEGER NOT NULL,
+                adopted_count INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS embedding_job_versions (
+                job_id INTEGER PRIMARY KEY REFERENCES embedding_jobs(id) ON DELETE CASCADE,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+        """)
         if applied:
             logger.info("Applied %d schema migration(s)", applied)
 
@@ -349,7 +415,7 @@ class Storage:
     def cold_search(self, query: str, target: str | None = None, limit: int = 20,
                     include_consolidated: bool = False,
                     include_dormant: bool = False,
-                    origin: str | None = None) -> list[dict]:
+                    origin: str | None = None, *, record_access: bool = True) -> list[dict]:
         """Search cold memory with FTS5 fallback to LIKE.
 
         By default, rows merged into a seed by Dream (dream_status='consolidated')
@@ -421,17 +487,47 @@ class Storage:
                     params,
                 ).fetchall()
 
-        results = []
-        for r in rows:
-            d = dict(r)
-            conn.execute(
-                "UPDATE cold_memory SET access_count=access_count+1, last_accessed=? WHERE id=?",
-                (time.time(), d["id"]),
-            )
-            results.append(d)
-        if results:
-            conn.commit()
+        results = [dict(r) for r in rows]
+        if record_access:
+            self.record_access(r["id"] for r in results)
         return results
+
+    def record_access(self, memory_ids) -> None:
+        """Best-effort telemetry for final results, once per distinct ID.
+
+        Never join or commit a caller's transaction, nor wait for a writer.
+        Skipping statistics during contention/transactions is intentional:
+        successful retrieval must not depend on acquiring a write lock.
+        """
+        ids = list(dict.fromkeys(memory_ids))
+        if not ids:
+            return
+        conn = self._get_conn()
+        if conn.in_transaction:
+            return
+        timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        try:
+            conn.execute("PRAGMA busy_timeout=0")
+            with atomic(conn):
+                now = time.time()
+                # One UPDATE per bounded chunk, all chunks in one transaction.
+                variable_limit = (conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+                                  if hasattr(conn, "getlimit") else 999)  # Python 3.10
+                batch_size = min(500, variable_limit - 1)
+                if batch_size < 1:
+                    return
+                for start in range(0, len(ids), batch_size):
+                    batch = ids[start:start + batch_size]
+                    marks = ",".join("?" for _ in batch)
+                    conn.execute(
+                        "UPDATE cold_memory SET access_count=access_count+1, last_accessed=? "
+                        f"WHERE id IN ({marks})", (now, *batch),
+                    )
+        except sqlite3.Error as exc:
+            # Do not log memory IDs, content, or expanded SQL.
+            logger.debug("Access statistics skipped (%s)", type(exc).__name__)
+        finally:
+            conn.execute(f"PRAGMA busy_timeout={timeout}")
 
     def cold_get(self, memory_id: str) -> dict | None:
         conn = self._get_conn()
@@ -511,20 +607,31 @@ class Storage:
 
     def cold_update(self, memory_id: str, content: str) -> dict:
         conn = self._get_conn()
-        row = conn.execute("SELECT id FROM cold_memory WHERE id=?", (memory_id,)).fetchone()
+        row = self.cold_get(memory_id)
         if not row:
             return {"error": f"Memory {memory_id} not found"}
-        chash = _content_hash(content)
-        conn.execute(
-            "UPDATE cold_memory SET content=?, content_hash=?, updated_at=unixepoch('now') WHERE id=?",
-            (content, chash, memory_id),
-        )
-        conn.commit()
         from .embedding import get_embedding
         vec = get_embedding(content)
-        if vec:
-            self.vec_delete(memory_id)
+        if vec is None:
+            raise ValueError("embedding failed; cold update was not committed")
+        with atomic(conn):
+            if not self._entry_matches(memory_id, row):
+                raise ValueError("cold entry changed during embedding; retry update")
+            version = max(time.time(), math.nextafter(float(row["updated_at"]), math.inf))
+            conn.execute(
+                "UPDATE cold_memory SET content=?, content_hash=?, updated_at=? WHERE id=?",
+                (content, _content_hash(content), version, memory_id),
+            )
             self.vec_store(memory_id, vec)
+            # Invalidate pending/running same-text/ABA jobs in the SAME commit
+            # as the new vec, so a late completion cannot overwrite it. Preserve
+            # historical failed rows field-for-field; reconciliation is additive
+            # audit evidence, not permission to erase their status/error/attempts.
+            conn.execute(
+                "UPDATE embedding_jobs SET status='done', last_error='superseded by cold_update', "
+                "updated_at=datetime('now') WHERE target_table='cold_memory' AND target_id=? "
+                "AND status IN ('pending', 'running')", (memory_id,),
+            )
         return {"id": memory_id, "status": "updated"}
 
     def cold_timeline(self, target: str | None = None, limit: int = 50, offset: int = 0,
@@ -755,26 +862,147 @@ class Storage:
 
     @staticmethod
     def _serialize_vec(vec: list[float]) -> bytes:
-        return struct.pack(f"<{len(vec)}f", *vec)
+        values = validate_vector(vec)
+        return struct.pack(f"<{len(values)}f", *values)
 
-    def vec_store(self, memory_id: str, embedding: list[float]) -> None:
+    @staticmethod
+    def _vector_identity(embedding, model=None, space_id=None):
+        tagged_model = getattr(embedding, "model", None)
+        tagged_space = getattr(embedding, "space_id", None)
+        if (model and tagged_model and model != tagged_model) or (
+            space_id and tagged_space and space_id != tagged_space
+        ):
+            raise VectorSpaceError("vector provenance conflicts with explicit metadata")
+        model, space_id = model or tagged_model, space_id or tagged_space
+        if not model or not space_id:
+            raise VectorSpaceError("vector requires explicit model AND space provenance")
+        return model, space_id
+
+    def _check_vector_space(self, conn, model, space_id):
+        # Hot path: ordinary indexed metadata ONLY, never a vec0/BLOB join.
+        # All supported vector writers maintain the three tables atomically.
+        # Full physical integrity is checked explicitly during legacy adoption;
+        # reading a query must not turn into an O(N^2) virtual-table audit.
+        bad = conn.execute("""
+            SELECT e.memory_id FROM cold_embeddings e INDEXED BY idx_cold_embeddings_identity
+            LEFT JOIN embedding_spaces s ON s.memory_id=e.memory_id
+            WHERE s.space_id IS NULL OR s.space_id != ? OR s.model != ?
+               OR e.model != s.model
+            UNION ALL
+            SELECT s.memory_id FROM embedding_spaces s
+            LEFT JOIN cold_embeddings e ON e.memory_id=s.memory_id
+            WHERE e.memory_id IS NULL
+            LIMIT 1
+        """, (space_id, model)).fetchone()
+        if bad:
+            raise VectorSpaceError("index has unknown/incompatible vector space; explicit migration required")
+
+    def _validate_legacy_vectors(self, conn, model, space_id):
+        """Full physical audit, only for explicit adoption (never query/startup).
+
+        Scan vec0 once and look up the ordinary table by its primary key, not
+        the reverse: vec0 equality joins can become quadratic. Compare the
+        original bytes, not reserialized or approximately equal vectors.
+        """
+        bad = conn.execute("""
+            SELECT e.memory_id FROM cold_embeddings e
+            LEFT JOIN cold_memory m ON m.id=e.memory_id
+            WHERE e.model != ? OR length(e.embedding) != 768 * 4 OR m.id IS NULL
+            UNION ALL
+            SELECT s.memory_id FROM embedding_spaces s
+            LEFT JOIN cold_embeddings e ON e.memory_id=s.memory_id
+            WHERE e.memory_id IS NULL OR s.model != ? OR s.space_id != ?
+            LIMIT 1
+        """, (model, model, space_id)).fetchone()
+        if bad:
+            raise VectorSpaceError("legacy adoption rejected: model, dimension, orphan or space conflict")
+        total = conn.execute("SELECT count(*) FROM cold_embeddings").fetchone()[0]
+        if not total:
+            raise VectorSpaceError("legacy adoption requires a nonempty vector corpus")
+        seen = set()
+        for row in conn.execute("SELECT memory_id, embedding FROM cold_memory_vec"):
+            mid, blob = row["memory_id"], row["embedding"]
+            stored = conn.execute(
+                "SELECT embedding FROM cold_embeddings WHERE memory_id=?", (mid,)
+            ).fetchone()
+            if mid in seen or stored is None or blob != stored[0]:
+                raise VectorSpaceError("legacy adoption rejected: vec0/blob orphan or byte mismatch")
+            # Reject invalid numerical payloads even if both copies match.
+            validate_vector(struct.unpack("<768f", blob))
+            seen.add(mid)
+        if len(seen) != total:
+            raise VectorSpaceError("legacy adoption rejected: missing vec0 rows")
+        return total
+
+    def adopt_legacy_space(self, model, space_id, evidence: str) -> dict:
+        """Explicit operator attestation; NEVER invoked automatically.
+
+        The caller supplies provenance evidence: structural consistency alone
+        cannot prove semantic compatibility. Only missing space metadata and a
+        separate audit record are inserted. Old rows/models/blobs/jobs remain
+        untouched. A fresh BEGIN IMMEDIATE prevents concurrent corpus changes;
+        reject caller transactions instead of silently weakening that contract.
+        """
+        if any(not isinstance(value, str) or not value.strip()
+               for value in (model, space_id, evidence)):
+            raise VectorSpaceError("adoption requires nonempty model, space_id and evidence strings")
         conn = self._get_conn()
-        blob = self._serialize_vec(embedding)
-        conn.execute(
-            "INSERT OR REPLACE INTO cold_embeddings (memory_id, embedding, created_at) VALUES (?,?,?)",
-            (memory_id, blob, time.time()),
+        if conn.in_transaction:
+            raise VectorSpaceError("legacy adoption requires its own BEGIN IMMEDIATE transaction")
+        with atomic(conn):
+            total = self._validate_legacy_vectors(conn, model, space_id)
+            added = conn.execute("""
+                INSERT INTO embedding_spaces (memory_id, space_id, model)
+                SELECT e.memory_id, ?, ? FROM cold_embeddings e
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM embedding_spaces s WHERE s.memory_id=e.memory_id
+                )
+            """, (space_id, model)).rowcount
+            created_at = time.time()
+            audit_id = conn.execute("""
+                INSERT INTO embedding_space_adoptions
+                    (model, space_id, evidence, created_at, validated_count, adopted_count)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (model, space_id, evidence, created_at, total, added)).lastrowid
+        return {"audit_id": audit_id, "model": model, "space_id": space_id,
+                "validated_count": total, "adopted_count": added, "created_at": created_at}
+
+    def _entry_matches(self, memory_id, expected):
+        row = self.cold_get(memory_id)
+        return row is not None and all(
+            row[key] == expected[key] for key in ("content", "created_at", "updated_at")
         )
-        conn.execute(
-            "INSERT OR REPLACE INTO cold_memory_vec (memory_id, embedding) VALUES (?,?)",
-            (memory_id, blob),
-        )
-        conn.commit()
+
+    def vec_store(self, memory_id: str, embedding: list[float], model: Optional[str] = None,
+                  *, space_id: str | None = None, expected: dict | None = None) -> None:
+        blob = self._serialize_vec(embedding)  # validate BEFORE any mutation
+        model, space_id = self._vector_identity(embedding, model, space_id)
+        conn = self._get_conn()
+        with atomic(conn):
+            if expected is not None and not self._entry_matches(memory_id, expected):
+                raise ValueError("stale embedding: cold content/version changed")
+            self._check_vector_space(conn, model, space_id)
+            conn.execute(
+                "INSERT INTO cold_embeddings (memory_id, embedding, model, created_at) VALUES (?,?,?,?) "
+                "ON CONFLICT(memory_id) DO UPDATE SET embedding=excluded.embedding, "
+                "model=excluded.model, created_at=excluded.created_at",
+                (memory_id, blob, model, time.time()),
+            )
+            # vec0 does not honor INSERT OR REPLACE. Keep delete+insert and
+            # provenance in ONE rollback boundary, including caller transactions.
+            conn.execute("DELETE FROM cold_memory_vec WHERE memory_id=?", (memory_id,))
+            conn.execute("INSERT INTO cold_memory_vec (memory_id, embedding) VALUES (?,?)", (memory_id, blob))
+            conn.execute(
+                "INSERT INTO embedding_spaces (memory_id, space_id, model) VALUES (?,?,?) "
+                "ON CONFLICT(memory_id) DO UPDATE SET space_id=excluded.space_id, model=excluded.model",
+                (memory_id, space_id, model),
+            )
 
     def vec_delete(self, memory_id: str) -> None:
         conn = self._get_conn()
-        conn.execute("DELETE FROM cold_embeddings WHERE memory_id=?", (memory_id,))
-        conn.execute("DELETE FROM cold_memory_vec WHERE memory_id=?", (memory_id,))
-        conn.commit()
+        with atomic(conn):
+            conn.execute("DELETE FROM cold_embeddings WHERE memory_id=?", (memory_id,))
+            conn.execute("DELETE FROM cold_memory_vec WHERE memory_id=?", (memory_id,))
 
     # L2 distance threshold for relevance filtering.
     # For nomic-embed-text (768d, normalized), empirically:
@@ -784,81 +1012,134 @@ class Storage:
 
     def vec_search(self, query_embedding: list[float], target: str | None = None,
                    limit: int = 20, include_dormant: bool = False,
-                   origin: str | None = None) -> list[dict]:
-        """Pure KNN vector search.
-
-        ⚠️ Known limitation: when ``origin`` is set, filtering happens AFTER
-        KNN retrieval (sqlite-vec JOIN quirk forbids in-SQL filter). If the
-        ``fetch_k * 3`` nearest neighbours contain no rows with the target
-        source, results will be empty even when matching rows exist.
-        Workaround: use mode='hybrid' (default) — its FTS path filters
-        ``source`` directly in SQL and dominates RRF fusion.
-        """
+                   origin: str | None = None, *, model: str | None = None,
+                   space_id: str | None = None, scope: str | None = None,
+                   agent_id: str | None = None,
+                   include_consolidated: bool = False) -> list[dict]:
+        # Gate and retrieval share one read snapshot; a concurrent writer cannot
+        # change the corpus between the compatibility check and distance scan.
+        self._serialize_vec(query_embedding)
         conn = self._get_conn()
-        # sqlite-vec quirk: KNN MATCH on empty vec0 table raises "unknown error".
-        # Guard with a fast count check.
-        cnt = conn.execute("SELECT COUNT(*) FROM cold_memory_vec").fetchone()[0]
-        if cnt == 0:
-            return []
-        blob = self._serialize_vec(query_embedding)
-        fetch_k = max(limit * 3, 30)
-        # NOTE: Avoid KNN MATCH — sqlite-vec v0.1.9 raises OperationalError
-        # ('unknown error') intermittently when MATCH is mixed with sqlite3.Row
-        # factory, PRAGMA setup, or JOIN. Use vec_distance_l2() + ORDER BY
-        # instead. For small tables (<10k rows) this is fast enough and robust.
         try:
-            knn = conn.execute(
-                "SELECT memory_id, vec_distance_l2(embedding, ?) AS distance "
-                "FROM cold_memory_vec ORDER BY distance LIMIT ?",
-                (blob, fetch_k),
+            model, space_id = self._vector_identity(query_embedding, model, space_id)
+            with atomic(conn, write=False):
+                self._check_vector_space(conn, model, space_id)
+                return self._vec_search_checked(
+                    query_embedding, target, limit, include_dormant, origin,
+                    scope=scope, agent_id=agent_id, include_consolidated=include_consolidated,
+                )
+        except VectorSpaceError as exc:
+            logger.warning("Vector search disabled: %s", exc)
+            return []
+
+    def _vec_search_checked(self, query_embedding: list[float], target: str | None = None,
+                            limit: int = 20, include_dormant: bool = False,
+                            origin: str | None = None, *, scope: str | None = None,
+                            agent_id: str | None = None,
+                            include_consolidated: bool = False) -> list[dict]:
+        """Exact filtered L2 search, with a bounded KNN fast path.
+
+        KNN prefixes expand until exhaustion or a strictly farther boundary
+        proves that no eligible nearer/tied hit is hidden. If vec0's 4096 ceiling
+        prevents that proof, use the exact scalar fallback, never truncate recall.
+        The fallback filters metadata before LIMIT, computes each distance once,
+        and sorts IDs/distances only. Threshold pruning of the sorted prefix
+        cannot hide a nearer eligible hit. Full rows are fetched only for final
+        hits, inside vec_search's existing read snapshot.
+
+        scope is an optional exact metadata filter, NOT an ACL. Omitted filters
+        retain the existing cross-scope search contract; no implicit global or
+        shared visibility rules are introduced. agent_id uses timeline's exact
+        match / '__local__' (NULL) convention. This primitive remains read-only
+        for dedup and maintenance callers; the engine counts final search hits.
+        """
+        if limit <= 0:
+            return []
+        conn = self._get_conn()
+        clauses = []
+        params: list[Any] = [self._serialize_vec(query_embedding)]
+        for column, value in (("target", target), ("source", origin), ("scope", scope)):
+            if value:
+                clauses.append(f"cm.{column} = ?")
+                params.append(value)
+        if agent_id == "__local__":
+            clauses.append("cm.agent_id IS NULL")
+        elif agent_id:
+            clauses.append("cm.agent_id = ?")
+            params.append(agent_id)
+        if not include_dormant:
+            clauses.append("COALESCE(cm.dream_status, 'active') != 'dormant'")
+        if not include_consolidated:
+            clauses.append("COALESCE(cm.dream_status, 'active') != 'consolidated'")
+        filter_sql = ' AND '.join(clauses) if clauses else '1'
+        rows = None
+        if limit <= 4096:
+            window = min(4096, max(32, limit + 1))
+            while True:
+                try:
+                    neighbors = conn.execute(
+                        "SELECT memory_id, distance FROM cold_memory_vec "
+                        "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                        (params[0], window),
+                    ).fetchall()
+                except sqlite3.OperationalError as exc:
+                    # Some vec0 builds/connection states reject MATCH. Retain
+                    # the complete scalar path rather than failing a read or
+                    # returning a partial prefix. Scalar failures still surface.
+                    logger.debug("KNN fast path unavailable (%s)", type(exc).__name__)
+                    break
+                candidates = [row for row in neighbors
+                              if row["distance"] <= self.VEC_DISTANCE_THRESHOLD]
+                eligible = set()
+                for start in range(0, len(candidates), 500):
+                    ids = [row["memory_id"] for row in candidates[start:start + 500]]
+                    placeholders = ",".join("?" for _ in ids)
+                    eligible.update(row["id"] for row in conn.execute(
+                        "SELECT cm.id FROM cold_memory cm "
+                        f"WHERE cm.id IN ({placeholders}) AND {filter_sql}",
+                        [*ids, *params[1:]],
+                    ))
+                prefix = sorted(
+                    ({"id": row["memory_id"], "vec_distance": row["distance"]}
+                     for row in candidates if row["memory_id"] in eligible),
+                    key=lambda row: (row["vec_distance"], row["id"]),
+                )
+                # Strict > is essential: vec0 can omit lexically earlier IDs
+                # at a tied KNN boundary, even when enough eligible hits exist.
+                if (len(neighbors) < window
+                        or neighbors[-1]["distance"] > self.VEC_DISTANCE_THRESHOLD
+                        or (len(prefix) >= limit
+                            and neighbors[-1]["distance"] > prefix[limit - 1]["vec_distance"])):
+                    rows = prefix[:limit]
+                    break
+                if window == 4096:
+                    break
+                window = min(4096, window * 2)
+        if rows is None:
+            # CROSS JOIN fixes vec0 first: reverse virtual-table ID lookups can
+            # be quadratic. Metadata filters precede the exact scalar LIMIT.
+            rows = conn.execute(
+                "SELECT cm.id, vec_distance_l2(v.embedding, ?) AS vec_distance "
+                "FROM cold_memory_vec v CROSS JOIN cold_memory cm ON cm.id = v.memory_id "
+                f"WHERE {filter_sql} ORDER BY vec_distance, cm.id LIMIT ?",
+                [*params, limit],
             ).fetchall()
-        except sqlite3.OperationalError as e:
-            import traceback
-            logger.warning("vec_search failed: %s\n%s", e, traceback.format_exc())
-            return []
-
-        if not knn:
-            return []
-
-        # Build id→distance map preserving KNN order
-        ordered_ids = []
-        dist_by_id = {}
-        for r in knn:
-            mid = r["memory_id"] if isinstance(r, sqlite3.Row) else r[0]
-            dist = r["distance"] if isinstance(r, sqlite3.Row) else r[1]
-            ordered_ids.append(mid)
-            dist_by_id[mid] = dist
-
-        # Fetch full memory rows in a second query (sqlite-vec JOIN quirk).
-        placeholders = ",".join("?" * len(ordered_ids))
-        rows = conn.execute(
-            f"SELECT * FROM cold_memory WHERE id IN ({placeholders})",
-            ordered_ids,
-        ).fetchall()
-        by_id = {r["id"]: dict(r) for r in rows}
-
-        results = []
-        for mid in ordered_ids:  # preserve KNN ranking
-            d = by_id.get(mid)
-            if not d:
-                continue
-            distance = dist_by_id.get(mid)
-            if target and d.get("target") != target:
-                continue
-            if origin and d.get("source") != origin:
-                continue
-            # F5 v0.3: dormant rows must NOT surface in retrieval unless caller
-            # explicitly opts in (audit / restore UI). Filter applies to ALL
-            # downstream callers (hybrid_search/cold_search wrap this).
-            if not include_dormant and d.get("dream_status") == "dormant":
-                continue
-            if distance is not None and distance > self.VEC_DISTANCE_THRESHOLD:
-                continue
-            d["vec_distance"] = distance
-            results.append(d)
-            if len(results) >= limit:
-                break
-        return results
+        hits = [row for row in rows
+                if row["vec_distance"] is not None
+                and row["vec_distance"] <= self.VEC_DISTANCE_THRESHOLD]
+        # Stay below SQLite's historical 999-variable limit, including when the
+        # caller requests more than vec0 KNN's 4096-result ceiling. IN does not
+        # preserve distance order, so reassemble using the sorted hit sequence.
+        by_id = {}
+        for start in range(0, len(hits), 500):
+            ids = [row["id"] for row in hits[start:start + 500]]
+            placeholders = ",".join("?" for _ in ids)
+            for row in conn.execute(
+                f"SELECT * FROM cold_memory WHERE id IN ({placeholders})", ids
+            ):
+                by_id[row["id"]] = dict(row)
+        return [dict(by_id[row["id"]], vec_distance=row["vec_distance"])
+                for row in hits]
 
     def vec_count(self) -> int:
         conn = self._get_conn()

@@ -11,6 +11,8 @@ See skill `sqlite-async-embedding-queue` for the design rationale.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import sqlite3
@@ -28,13 +30,73 @@ IDLE_BACKOFF_SECONDS = 2.0  # back off when queue is empty
 # ── Queue ops (sync, called from request path or worker) ──
 
 def enqueue(conn: sqlite3.Connection, target_table: str, target_id: str, content: str) -> int:
-    """Enqueue a pending embedding job. Returns job id."""
-    cur = conn.execute(
-        "INSERT INTO embedding_jobs (target_table, target_id, content) VALUES (?,?,?)",
-        (target_table, target_id, content),
+    """Enqueue with a durable content-version snapshot in the same transaction."""
+    if target_table != "cold_memory":
+        raise ValueError("unsupported embedding target_table")
+    from .storage import atomic
+    with atomic(conn):
+        row = conn.execute(
+            "SELECT content, created_at, updated_at FROM cold_memory WHERE id=?", (target_id,),
+        ).fetchone()
+        if row is not None and row["content"] != content:
+            raise ValueError("enqueue content is stale")
+        cur = conn.execute(
+            "INSERT INTO embedding_jobs (target_table, target_id, content) VALUES (?,?,?)",
+            (target_table, target_id, content),
+        )
+        job_id = int(cur.lastrowid)
+        if row is not None:
+            conn.execute(
+                "INSERT INTO embedding_job_versions (job_id, created_at, updated_at) VALUES (?,?,?)",
+                (job_id, row["created_at"], row["updated_at"]),
+            )
+    return job_id
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,),
+    ).fetchone() is not None
+
+
+def _record_completion_receipt(conn, job_id, target_id, expected):
+    """Bind a CAS-checked completion to exact stored bytes/revision/space.
+
+    Called ONLY after vec_store inside complete_job's transaction. Historical
+    vectors must never be backfilled with guessed receipts. No FK/cascade: this
+    is durable evidence, not a disposable queue implementation detail.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS embedding_job_receipts (
+            job_id INTEGER PRIMARY KEY,
+            target_id TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            recorded_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_embedding_job_receipts_target ON embedding_job_receipts(target_id,job_id)")
+    row = conn.execute("""
+        SELECT e.embedding, e.model, e.created_at, s.space_id, s.model AS space_model
+        FROM cold_embeddings e JOIN embedding_spaces s ON s.memory_id=e.memory_id
+        WHERE e.memory_id=?
+    """, (target_id,)).fetchone()
+    indexed = conn.execute(
+        "SELECT embedding FROM cold_memory_vec WHERE memory_id=?", (target_id,),
+    ).fetchone()
+    if row is None or indexed is None or row['embedding'] != indexed[0] or row['model'] != row['space_model']:
+        raise ValueError('completion receipt requires consistent stored vector and space')
+    evidence = {
+        'receipt_version': 1,
+        'content_sha256': hashlib.sha256(expected['content'].encode('utf-8')).hexdigest(),
+        'created_at': expected['created_at'], 'updated_at': expected['updated_at'],
+        'vector_sha256': hashlib.sha256(row['embedding']).hexdigest(),
+        'vector_created_at': row['created_at'],
+        'model': row['model'], 'space_id': row['space_id'],
+    }
+    conn.execute(
+        'INSERT INTO embedding_job_receipts(job_id,target_id,evidence_json) VALUES (?,?,?)',
+        (job_id, target_id, json.dumps(evidence, sort_keys=True, separators=(',', ':'))),
     )
-    conn.commit()
-    return int(cur.lastrowid)
 
 
 def fetch_one_pending(conn: sqlite3.Connection) -> Optional[dict]:
@@ -47,10 +109,18 @@ def fetch_one_pending(conn: sqlite3.Connection) -> Optional[dict]:
     # touch the table).
     conn.execute("BEGIN IMMEDIATE")
     try:
+        # Reconciliation never rewrites historical status/error/attempts. Any
+        # audited failed row (including needs_confirmation) is explicitly held;
+        # resolving a hold requires a separate operator decision, not a retry.
+        hold = (
+            "AND NOT EXISTS (SELECT 1 FROM embedding_job_reconciliation a "
+            "WHERE a.job_id=embedding_jobs.id) "
+            if _table_exists(conn, "embedding_job_reconciliation") else ""
+        )
         row = conn.execute(
             "SELECT id, target_table, target_id, content, attempts "
             "FROM embedding_jobs "
-            "WHERE status IN ('pending', 'failed') AND attempts < ? "
+            "WHERE status IN ('pending', 'failed') AND attempts < ? " + hold +
             "ORDER BY id ASC LIMIT 1",
             (MAX_ATTEMPTS,),
         ).fetchone()
@@ -87,7 +157,7 @@ def mark_failed(conn: sqlite3.Connection, job_id: int, error: str) -> None:
     conn.execute(
         "UPDATE embedding_jobs "
         "SET status='failed', attempts=attempts+1, last_error=?, updated_at=datetime('now') "
-        "WHERE id=?",
+        "WHERE id=? AND status='running'",
         (error[:500], job_id),
     )
     conn.commit()
@@ -108,9 +178,13 @@ def reset_running_on_startup(conn: sqlite3.Connection) -> int:
 
 def cleanup_done(conn: sqlite3.Connection, older_than_days: int = 7) -> int:
     """Delete completed jobs older than N days. Returns deleted count."""
+    keep = ""
+    for table in ("embedding_job_receipts", "embedding_job_reconciliation"):
+        if _table_exists(conn, table):
+            keep += f" AND NOT EXISTS (SELECT 1 FROM {table} a WHERE a.job_id=embedding_jobs.id)"
     cur = conn.execute(
         "DELETE FROM embedding_jobs WHERE status='done' "
-        "AND updated_at < datetime('now', ?)",
+        "AND updated_at < datetime('now', ?)" + keep,
         (f"-{older_than_days} days",),
     )
     conn.commit()
@@ -118,11 +192,81 @@ def cleanup_done(conn: sqlite3.Connection, older_than_days: int = 7) -> int:
 
 
 def queue_stats(conn: sqlite3.Connection) -> dict:
-    """Return counts by status. Useful for /v1/stats and tests."""
+    """Raw status counts plus historical audit outcomes, in one read snapshot.
+
+    ``failed`` remains the original counter for compatibility. Subtract only
+    explicitly resolved/superseded historical audits in ``failed_unresolved``;
+    needs_confirmation is still unresolved, never an automatic retry request.
+    """
+    own = not conn.in_transaction
+    if own:
+        conn.execute("BEGIN")
+    try:
+        result = _queue_stats_snapshot(conn)
+        if own:
+            conn.commit()
+        return result
+    except BaseException:
+        if own:
+            conn.rollback()
+        raise
+
+
+def _queue_stats_snapshot(conn: sqlite3.Connection) -> dict:
     rows = conn.execute(
         "SELECT status, COUNT(*) AS n FROM embedding_jobs GROUP BY status"
     ).fetchall()
-    return {row["status"]: row["n"] for row in rows}
+    result = {row["status"]: row["n"] for row in rows}
+    if _table_exists(conn, "embedding_job_reconciliation"):
+        # Preserve the established raw status counts. Additional keys describe
+        # historical audit outcomes, not a claim that failed jobs ran to done.
+        counts = {r[0]: r[1] for r in conn.execute("""
+            SELECT a.decision, count(*) FROM embedding_job_reconciliation a
+            JOIN embedding_jobs j ON j.id=a.job_id AND j.status='failed'
+            WHERE a.id=(SELECT max(b.id) FROM embedding_job_reconciliation b WHERE b.job_id=a.job_id)
+            GROUP BY a.decision
+        """)}
+        for decision in ("resolved", "superseded", "needs_confirmation"):
+            result["historical_" + decision] = counts.get(decision, 0)
+        result["failed_unresolved"] = result.get("failed", 0) - counts.get("resolved", 0) - counts.get("superseded", 0)
+    return result
+
+
+def complete_job(storage, job: dict, vec: list[float]) -> bool:
+    """CAS validation, vector replacement and job completion are ONE commit.
+
+    Missing legacy version evidence is stale, not permission to overwrite.
+    Returns False for discarded jobs; failures roll back before mark_failed.
+    """
+    from .storage import atomic
+    conn = storage._get_conn()
+    with atomic(conn):
+        current = conn.execute("SELECT * FROM embedding_jobs WHERE id=?", (job["id"],)).fetchone()
+        if current is None or current["status"] != "running":
+            return False
+        version = conn.execute(
+            "SELECT created_at, updated_at FROM embedding_job_versions WHERE job_id=?", (job["id"],),
+        ).fetchone()
+        valid = current["target_table"] == "cold_memory" and version is not None and all(
+            current[k] == job[k] for k in ("target_table", "target_id", "content", "attempts")
+        )
+        expected = dict(version) if version else {}
+        expected["content"] = current["content"]
+        valid = valid and storage._entry_matches(current["target_id"], expected)
+        newer = conn.execute(
+            "SELECT 1 FROM embedding_jobs WHERE target_table=? AND target_id=? AND id>? LIMIT 1",
+            (current["target_table"], current["target_id"], job["id"]),
+        ).fetchone()
+        if valid and not newer:
+            storage.vec_store(current["target_id"], vec, expected=expected)
+            _record_completion_receipt(conn, job["id"], current["target_id"], expected)
+        else:
+            valid = False
+        conn.execute(
+            "UPDATE embedding_jobs SET status='done', last_error=?, updated_at=datetime('now') WHERE id=?",
+            (None if valid else "stale job: target/content/version superseded or unverified", job["id"]),
+        )
+        return bool(valid)
 
 
 # ── Worker (async) ──
@@ -162,10 +306,7 @@ async def embedding_worker(engine, stop_event: asyncio.Event) -> None:
             vec = await asyncio.to_thread(get_embedding, job["content"])
             if not vec:
                 raise RuntimeError("get_embedding returned None/empty")
-            # vec_store handles INSERT OR REPLACE; safe even if a manual backfill
-            # raced with us.
-            storage.vec_store(job["target_id"], vec)
-            mark_done(storage._get_conn(), job["id"])
+            complete_job(storage, job, vec)
         except Exception as e:
             logger.warning(
                 "worker: job %d (target=%s) failed (attempt %d): %s",

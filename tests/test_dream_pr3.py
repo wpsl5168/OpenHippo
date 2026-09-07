@@ -124,7 +124,8 @@ class TestRestore:
         for i in range(2):
             r = engine.storage.cold_add("memory", f"cluster {i}")
             ids.append(r["id"])
-            engine.storage.vec_store(r["id"], [1.0 + i * 0.001] + [0.0] * 767)
+            engine.storage.vec_store(r["id"], [1.0 + i * 0.001] + [0.0] * 767,
+                                     model="synthetic-dream", space_id="synthetic-dream-768-v1")
         dream.consolidate(DreamConfig(l2_threshold=0.5))
 
         # ids[1] should be consolidated into ids[0]
@@ -176,7 +177,8 @@ class TestAutoloop:
         for i in range(2):
             r = e.storage.cold_add("memory", f"loop cluster {i}")
             ids.append(r["id"])
-            e.storage.vec_store(r["id"], [1.0 + i * 0.001] + [0.0] * 767)
+            e.storage.vec_store(r["id"], [1.0 + i * 0.001] + [0.0] * 767,
+                                     model="synthetic-dream", space_id="synthetic-dream-768-v1")
 
         # Run loop with sub-second interval; cancel after enough time for one tick
         task = asyncio.create_task(rest_mod._dream_autoloop(0.2))

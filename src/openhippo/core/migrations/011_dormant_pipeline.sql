@@ -8,14 +8,14 @@ CREATE TRIGGER IF NOT EXISTS cold_memory_bi_dreamstatus
 BEFORE INSERT ON cold_memory
 WHEN NEW.dream_status NOT IN ('active', 'dormant', 'consolidated')
 BEGIN
-  SELECT RAISE(ABORT, 'invalid dream_status: ' || COALESCE(NEW.dream_status, 'NULL'));
+  SELECT RAISE(ABORT, 'invalid dream_status');
 END;
 
 CREATE TRIGGER IF NOT EXISTS cold_memory_bu_dreamstatus
 BEFORE UPDATE OF dream_status ON cold_memory
 WHEN NEW.dream_status NOT IN ('active', 'dormant', 'consolidated')
 BEGIN
-  SELECT RAISE(ABORT, 'invalid dream_status: ' || COALESCE(NEW.dream_status, 'NULL'));
+  SELECT RAISE(ABORT, 'invalid dream_status');
 END;
 
 -- ─── 2. partial index for purge job hot path ───

@@ -169,17 +169,30 @@ class DreamEngine:
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
     def _get_embedding(self, memory_id: str) -> list[float] | None:
-        """Re-hydrate a stored embedding for clustering queries."""
-        conn = self.storage._get_conn()
-        row = conn.execute(
-            "SELECT embedding FROM cold_embeddings WHERE memory_id = ?", (memory_id,)
-        ).fetchone()
-        if not row:
-            return None
+        """Rehydrate verified stored provenance, never the current provider's.
+
+        Missing/conflicting metadata stays fail-closed until explicit adoption.
+        The subsequent vec_search checks the whole corpus in its read snapshot.
+        """
+        from .embedding import EmbeddingVector, validate_vector
         import struct
-        blob = row[0]
-        n = len(blob) // 4
-        return list(struct.unpack(f"<{n}f", blob))
+
+        conn = self.storage._get_conn()
+        row = conn.execute("""
+            SELECT e.embedding, e.model, s.space_id FROM cold_embeddings e
+            JOIN embedding_spaces s ON s.memory_id=e.memory_id AND s.model=e.model
+            WHERE e.memory_id=?
+        """, (memory_id,)).fetchone()
+        if not row or not row["model"] or not row["space_id"]:
+            return None
+        blob = row["embedding"]
+        if len(blob) != 768 * 4:
+            return None
+        try:
+            values = validate_vector(struct.unpack("<768f", blob))
+        except ValueError:
+            return None
+        return EmbeddingVector(values, model=row["model"], space_id=row["space_id"])
 
     # ── Stage 2: Cluster (greedy single-link) ──
     def _cluster(self, candidates: list[dict], cfg: DreamConfig) -> list[Cluster]:

@@ -137,7 +137,9 @@ class HippoEngine:
         # Threshold 0.4 ≈ cos > 0.92.
         for entry in self.storage.hot_list(target):
             evec = get_embedding(self._normalize_content(entry["content"]))
-            if not evec or len(evec) != len(query_vec):
+            if (not evec or len(evec) != len(query_vec)
+                    or not getattr(query_vec, "space_id", None)
+                    or getattr(evec, "space_id", None) != query_vec.space_id):
                 continue
             cos = sum(a * b for a, b in zip(query_vec, evec))
             d = (2.0 - 2.0 * cos) ** 0.5 if cos < 1 else 0.0
@@ -234,7 +236,9 @@ class HippoEngine:
         if not vec:
             logger.warning("Embedding failed, falling back to FTS")
             return self.storage.cold_search(query, target, limit, origin=origin)
-        return self.storage.vec_search(vec, target, limit, origin=origin)
+        results = self.storage.vec_search(vec, target, limit, origin=origin)
+        self.storage.record_access(r["id"] for r in results)
+        return results
 
     def _hybrid_search(self, query: str, target: str | None, limit: int,
                        rrf_k: int = 60, origin: str | None = None) -> list[dict]:
@@ -242,8 +246,11 @@ class HippoEngine:
         
         Score = Σ 1/(k + rank_i) for each retrieval path.
         """
-        # FTS path
-        fts_results = self.storage.cold_search(query, target, limit, origin=origin)
+        if limit <= 0:
+            return []
+        # Candidate retrieval must not count rows discarded by RRF, or count
+        # the same memory twice when both retrieval paths find it.
+        fts_results = self.storage.cold_search(query, target, limit, origin=origin, record_access=False)
 
         # Vector path
         vec = get_embedding(query)
@@ -251,6 +258,7 @@ class HippoEngine:
 
         if not vec_results:
             # No embeddings available, return FTS only
+            self.storage.record_access(r["id"] for r in fts_results)
             return fts_results
 
         # RRF fusion
@@ -275,6 +283,7 @@ class HippoEngine:
             entry = entries[mid]
             entry["rrf_score"] = round(score, 6)
             result.append(entry)
+        self.storage.record_access(r["id"] for r in result)
         return result
 
     # ── F3: Memory Replace ──
@@ -334,10 +343,13 @@ class HippoEngine:
         entry = self.storage.cold_get(memory_id)
         if not entry:
             return False
-        vec = get_embedding(entry["content"])
-        if vec:
-            self.storage.vec_store(memory_id, vec)
-            return True
+        try:
+            vec = get_embedding(entry["content"])
+            if vec:
+                self.storage.vec_store(memory_id, vec, expected=entry)
+                return True
+        except Exception as exc:
+            logger.warning("Embedding not stored for %s: %s", memory_id, exc)
         logger.warning("Failed to embed cold entry %s", memory_id)
         return False
 
@@ -349,8 +361,7 @@ class HippoEngine:
         """
         from . import embed_queue
         if not embed_queue.is_async_enabled():
-            self._embed_cold_entry(memory_id)
-            return "sync"
+            return "sync" if self._embed_cold_entry(memory_id) else "failed"
         if content is None:
             entry = self.storage.cold_get(memory_id)
             if not entry:
@@ -362,8 +373,7 @@ class HippoEngine:
         except Exception as e:
             # Queue failure must not break writes — fall back to sync.
             logger.warning("enqueue failed for %s, falling back to sync embed: %s", memory_id, e)
-            self._embed_cold_entry(memory_id)
-            return "sync"
+            return "sync" if self._embed_cold_entry(memory_id) else "failed"
 
     def embed_drain_now(self, max_jobs: int = 1000) -> dict:
         """Synchronously drain the embedding job queue.
@@ -373,7 +383,7 @@ class HippoEngine:
         """
         from . import embed_queue
         conn = self.storage._get_conn()
-        done, failed = 0, 0
+        done, failed, stale = 0, 0, 0
         for _ in range(max_jobs):
             job = embed_queue.fetch_one_pending(conn)
             if not job:
@@ -382,13 +392,14 @@ class HippoEngine:
                 vec = get_embedding(job["content"])
                 if not vec:
                     raise RuntimeError("empty embedding")
-                self.storage.vec_store(job["target_id"], vec)
-                embed_queue.mark_done(conn, job["id"])
-                done += 1
+                if embed_queue.complete_job(self.storage, job, vec):
+                    done += 1
+                else:
+                    stale += 1
             except Exception as e:
                 embed_queue.mark_failed(conn, job["id"], str(e))
                 failed += 1
-        return {"done": done, "failed": failed}
+        return {"done": done, "failed": failed, "stale": stale}
 
     def embed_all_cold(self) -> dict:
         """Backfill embeddings for all cold memories missing them."""
@@ -398,9 +409,7 @@ class HippoEngine:
         ).fetchall()
         success, failed = 0, 0
         for row in rows:
-            vec = get_embedding(row["content"])
-            if vec:
-                self.storage.vec_store(row["id"], vec)
+            if self._embed_cold_entry(row["id"]):
                 success += 1
             else:
                 failed += 1

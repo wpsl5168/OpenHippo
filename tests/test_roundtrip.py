@@ -72,24 +72,17 @@ class TestRoundTrip:
         db2 = tmp_path / "db2.db"
         e2 = HippoEngine(db_path=db2)
 
-        imported_hot = 0
-        imported_cold = 0
-        for mem in doc["memories"]:
-            if mem["layer"] == "hot":
-                e2.storage.hot_add(mem["target"], mem["content"])
-                imported_hot += 1
-            else:
-                result = e2.storage.cold_add(
-                    target=mem["target"],
-                    content=mem["content"],
-                    source=mem.get("source", "imported"),
-                    tags=mem.get("tags", []),
-                    metadata=mem.get("metadata", {}),
-                )
-                # Re-store embedding if available
-                if "embedding" in mem and mem["embedding"]:
-                    e2.storage.vec_store(result["id"], mem["embedding"])
-                imported_cold += 1
+        # Exercise the shipped importer, not a handwritten lookalike restore.
+        from openhippo.core.importer import import_json
+        restored = import_json(e2.storage, doc)
+        assert restored["errors"] == []
+        imported_hot = restored["imported_hot"]
+        imported_cold = restored["imported_cold"]
+        assert {m["id"] for m in doc["memories"]} == {
+            row[0] for table in ("hot_memory", "cold_memory")
+            for row in e2.storage._get_conn().execute(f"SELECT id FROM {table}")
+        }
+        assert e2.storage._get_conn().execute("SELECT COUNT(*) FROM cold_memory_vec").fetchone()[0] == 10
 
         assert imported_hot == 10
         assert imported_cold == 10

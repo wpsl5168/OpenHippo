@@ -935,14 +935,33 @@ function hippo() {
     },
     async exportAll() {
       try {
-        const r = await fetch('/v1/export').then(r => r.json());
-        const blob = new Blob([JSON.stringify(r.data, null, 2)], { type: 'application/json' });
+        const response = await fetch('/v1/export?format=json&include_embeddings=true');
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        // The export endpoint returns the document itself, not a { data } envelope.
+        // Validate it, but download the original bytes without dropping fields or precision.
+        const content = await response.text();
+        const exported = JSON.parse(content);
+        if (!exported || !exported.header || typeof exported.header !== 'object' ||
+            Array.isArray(exported.header) || !Array.isArray(exported.memories) ||
+            typeof exported.header.schema_version !== 'string' || !exported.header.schema_version ||
+            !Number.isSafeInteger(exported.header.total_count) ||
+            exported.header.total_count !== exported.memories.length) {
+          throw new Error('导出数据格式或记录数量不完整');
+        }
+        const blob = new Blob([content], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url; a.download = 'hippocampus-export-' + new Date().toISOString().slice(0,10) + '.json';
-        a.click(); URL.revokeObjectURL(url);
-        this.notify('导出完成', 'ok');
-      } catch (e) { this.notify('导出失败', 'err'); }
+        try {
+          document.body.appendChild(a);
+          a.click();
+        } finally {
+          a.remove();
+          // Let the browser consume the blob before releasing it.
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }
+        this.notify('导出文件已生成，已开始下载', 'ok');
+      } catch (e) { this.notify('导出失败: ' + e.message, 'err'); }
     },
     copy(text) { navigator.clipboard.writeText(text); this.notify('已复制', 'ok'); },
 
@@ -1019,18 +1038,28 @@ function hippo() {
       const re = new RegExp('(' + q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
       const walker = document.createTreeWalker(wrapper, NodeFilter.SHOW_TEXT, {
         acceptNode: (n) => {
-          const p = n.parentNode;
-          if (p && (p.tagName === 'CODE' || p.tagName === 'PRE')) return NodeFilter.FILTER_REJECT;
+          if (n.parentElement?.closest('code, pre, mark')) return NodeFilter.FILTER_REJECT;
           return NodeFilter.FILTER_ACCEPT;
         }
       });
       const targets = [];
       while (walker.nextNode()) targets.push(walker.currentNode);
       for (const node of targets) {
-        if (!re.test(node.nodeValue)) continue;
         re.lastIndex = 0;
+        const text = node.nodeValue;
+        const matches = [...text.matchAll(re)];
+        if (!matches.length) continue;
         const span = document.createElement('span');
-        span.innerHTML = node.nodeValue.replace(re, '<mark class="hippo-mark">$1</mark>');
+        let offset = 0;
+        for (const match of matches) {
+          span.appendChild(document.createTextNode(text.slice(offset, match.index)));
+          const mark = document.createElement('mark');
+          mark.className = 'hippo-mark';
+          mark.textContent = match[0];
+          span.appendChild(mark);
+          offset = match.index + match[0].length;
+        }
+        span.appendChild(document.createTextNode(text.slice(offset)));
         node.parentNode.replaceChild(span, node);
       }
       return wrapper.innerHTML;
