@@ -162,9 +162,17 @@ async def embedding_worker(engine, stop_event: asyncio.Event) -> None:
             vec = await asyncio.to_thread(get_embedding, job["content"])
             if not vec:
                 raise RuntimeError("get_embedding returned None/empty")
+            # Tag the embedding with the active provider's model so a later
+            # backend switch is auditable (e.g. nomic-embed-text vs copilot).
+            model_name = None
+            try:
+                from .embedding import get_provider
+                model_name = getattr(get_provider(), "model", None)
+            except Exception:
+                pass
             # vec_store handles INSERT OR REPLACE; safe even if a manual backfill
             # raced with us.
-            storage.vec_store(job["target_id"], vec)
+            storage.vec_store(job["target_id"], vec, model=model_name)
             mark_done(storage._get_conn(), job["id"])
         except Exception as e:
             logger.warning(

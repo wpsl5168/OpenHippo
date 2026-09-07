@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import sqlite_vec
 
@@ -757,15 +757,25 @@ class Storage:
     def _serialize_vec(vec: list[float]) -> bytes:
         return struct.pack(f"<{len(vec)}f", *vec)
 
-    def vec_store(self, memory_id: str, embedding: list[float]) -> None:
+    def vec_store(self, memory_id: str, embedding: list[float], model: Optional[str] = None) -> None:
         conn = self._get_conn()
         blob = self._serialize_vec(embedding)
+        if model:
+            conn.execute(
+                "INSERT OR REPLACE INTO cold_embeddings (memory_id, embedding, model, created_at) VALUES (?,?,?,?)",
+                (memory_id, blob, model, time.time()),
+            )
+        else:
+            conn.execute(
+                "INSERT OR REPLACE INTO cold_embeddings (memory_id, embedding, created_at) VALUES (?,?,?)",
+                (memory_id, blob, time.time()),
+            )
+        # sqlite-vec (vec0) virtual tables do NOT honor INSERT OR REPLACE — a
+        # primary-key collision raises "UNIQUE constraint failed" instead of
+        # overwriting. Must DELETE the existing row first, then INSERT.
+        conn.execute("DELETE FROM cold_memory_vec WHERE memory_id=?", (memory_id,))
         conn.execute(
-            "INSERT OR REPLACE INTO cold_embeddings (memory_id, embedding, created_at) VALUES (?,?,?)",
-            (memory_id, blob, time.time()),
-        )
-        conn.execute(
-            "INSERT OR REPLACE INTO cold_memory_vec (memory_id, embedding) VALUES (?,?)",
+            "INSERT INTO cold_memory_vec (memory_id, embedding) VALUES (?,?)",
             (memory_id, blob),
         )
         conn.commit()

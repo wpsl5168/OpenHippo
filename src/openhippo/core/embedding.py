@@ -85,6 +85,122 @@ class EmbeddingProvider(ABC):
         """Embedding vector dimension."""
 
 
+class CopilotProvider(EmbeddingProvider):
+    """GitHub Copilot embedding backend (text-embedding-3-small @ 768 dims).
+
+    Uses the long-lived ``gho_*`` OAuth token from Hermes' ``~/.hermes/.env``
+    directly as a Bearer credential against ``api.githubcopilot.com/embeddings``.
+    No token exchange / refresh needed (the raw gho_ token is accepted directly).
+
+    Field-verified quirks (2026-07):
+    - ``input`` MUST be a JSON array; a bare string returns HTTP 400.
+    - ``dimensions=768`` truncates the native 1536-dim vector (Matryoshka) so it
+      stays compatible with the existing sqlite-vec float[768] store.
+    - Editor headers (Copilot-Integration-Id etc.) are required for auth.
+    """
+
+    def __init__(
+        self,
+        model: str = "text-embedding-3-small",
+        dimensions: int = EMBEDDING_DIM,  # 768
+        base_url: str = "https://api.githubcopilot.com",
+        timeout: float = 30.0,
+        token: Optional[str] = None,
+        env_path: str = "~/.hermes/.env",
+    ):
+        self.model = model
+        self.dimensions = dimensions
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self._env_path = env_path
+        self._token = token or self._load_token()
+
+    def _load_token(self) -> Optional[str]:
+        import os
+        # Prefer live env, fall back to parsing Hermes .env
+        tok = os.environ.get("COPILOT_GITHUB_TOKEN")
+        if tok:
+            return tok.strip().strip('"').strip("'")
+        try:
+            p = os.path.expanduser(self._env_path)
+            with open(p) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("COPILOT_GITHUB_TOKEN="):
+                        return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except Exception as e:
+            logger.warning("CopilotProvider: cannot read token from %s: %s", self._env_path, e)
+        return None
+
+    @property
+    def dimension(self) -> int:
+        return self.dimensions
+
+    def _headers(self) -> dict:
+        return {
+            "Authorization": f"Bearer {self._token}",
+            "Content-Type": "application/json",
+            "Editor-Version": "vscode/1.95.0",
+            "Editor-Plugin-Version": "copilot-chat/0.22.0",
+            "Copilot-Integration-Id": "vscode-chat",
+            "User-Agent": "GitHubCopilotChat/0.22.0",
+        }
+
+    def _post_batch(self, texts: list[str]) -> list[Optional[list[float]]]:
+        if not self._token:
+            logger.warning("CopilotProvider: no token available")
+            return [None] * len(texts)
+        payload = json.dumps({
+            "model": self.model,
+            "input": texts,               # MUST be array
+            "dimensions": self.dimensions,
+        }).encode()
+        req = urllib.request.Request(
+            f"{self.base_url}/embeddings",
+            data=payload,
+            headers=self._headers(),
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                data = json.loads(resp.read())
+            items = sorted(data.get("data", []), key=lambda d: d.get("index", 0))
+            out: list[Optional[list[float]]] = []
+            for it in items:
+                vec = it.get("embedding")
+                out.append(_l2_normalize(vec) if vec and len(vec) == self.dimensions else (vec or None))
+            # Pad if the API returned fewer than requested (shouldn't happen)
+            while len(out) < len(texts):
+                out.append(None)
+            return out
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode()[:200]
+            except Exception:
+                pass
+            logger.warning("Copilot embedding HTTP %s: %s", e.code, body)
+            return [None] * len(texts)
+        except Exception as e:
+            logger.warning("Copilot embedding failed: %s", e)
+            return [None] * len(texts)
+
+    def embed(self, text: str) -> Optional[list[float]]:
+        if not text:
+            return None
+        return self._post_batch([text])[0]
+
+    def embed_batch(self, texts: list[str]) -> list[Optional[list[float]]]:
+        if not texts:
+            return []
+        # Copilot accepts multi-input; keep batches modest to bound latency/payload.
+        BATCH = 64
+        results: list[Optional[list[float]]] = []
+        for i in range(0, len(texts), BATCH):
+            results.extend(self._post_batch(texts[i:i + BATCH]))
+        return results
+
+
 class OllamaProvider(EmbeddingProvider):
     """Ollama-based embedding (requires running Ollama service)."""
 
@@ -222,6 +338,14 @@ def _create_default_provider() -> EmbeddingProvider:
 
     cfg = get_config()
     provider_type = get(cfg, "embedding.provider", "auto")
+
+    if provider_type == "copilot":
+        return CopilotProvider(
+            model=get(cfg, "embedding.copilot.model", "text-embedding-3-small"),
+            dimensions=int(get(cfg, "embedding.copilot.dimensions", EMBEDDING_DIM)),
+            base_url=get(cfg, "embedding.copilot.base_url", "https://api.githubcopilot.com"),
+            env_path=get(cfg, "embedding.copilot.env_path", "~/.hermes/.env"),
+        )
 
     if provider_type == "ollama":
         return OllamaProvider(
