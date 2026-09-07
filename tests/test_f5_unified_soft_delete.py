@@ -14,6 +14,11 @@ import uuid
 from pathlib import Path
 
 import pytest
+from openhippo.core.embedding import EmbeddingVector
+
+
+def _synthetic_vector():
+    return EmbeddingVector([0.0] * 768, model="synthetic-f5", space_id="synthetic-f5-768-v1")
 
 # Each test gets a fresh DB so triggers/migrations don't accumulate.
 @pytest.fixture
@@ -92,12 +97,12 @@ def test_d13_promote_marks_cold_dormant(storage):
 def test_d14_vec_search_filters_dormant(storage):
     # Use stub embedding (zeroes) — vec_search just needs vec rows to exist.
     a = storage.cold_add(target="memory", content="d14 alpha")
-    storage.vec_store(a["id"], [0.0] * 768)
+    storage.vec_store(a["id"], _synthetic_vector())
     b = storage.cold_add(target="memory", content="d14 beta")
-    storage.vec_store(b["id"], [0.0] * 768)
+    storage.vec_store(b["id"], _synthetic_vector())
     storage.cold_delete(b["id"])  # soft delete beta
 
-    q = [0.0] * 768
+    q = _synthetic_vector()
     default = storage.vec_search(q, limit=10)
     ids_default = {r["id"] for r in default}
     assert b["id"] not in ids_default, "dormant must be filtered by default"
@@ -139,7 +144,7 @@ def test_d14b_all_recall_paths_filter_dormant(storage):
 def test_d15_vec_survives_dormant_and_restore(storage):
     res = storage.cold_add(target="memory", content="d15 sample")
     mid = res["id"]
-    storage.vec_store(mid, [0.0] * 768)
+    storage.vec_store(mid, _synthetic_vector())
     storage.cold_delete(mid)
     # vec row should still exist
     cnt = storage._get_conn().execute(
@@ -151,7 +156,7 @@ def test_d15_vec_survives_dormant_and_restore(storage):
     eng = DreamEngine(storage)
     eng.restore(mid)
     # findable in default vec_search now
-    res2 = storage.vec_search([0.0] * 768, limit=10)
+    res2 = storage.vec_search(_synthetic_vector(), limit=10)
     assert mid in {r["id"] for r in res2}
 
 

@@ -122,7 +122,8 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
         value = os.environ.get(env_var)
         if value is not None:
             _set_nested(config, dotpath, value)
-            logger.debug("Config override: %s=%s (from %s)", dotpath, value, env_var)
+            # Log provenance only: override values may contain credentials.
+            logger.debug("Config override: %s (from %s)", dotpath, env_var)
 
     return config
 

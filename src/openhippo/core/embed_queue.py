@@ -28,13 +28,27 @@ IDLE_BACKOFF_SECONDS = 2.0  # back off when queue is empty
 # ── Queue ops (sync, called from request path or worker) ──
 
 def enqueue(conn: sqlite3.Connection, target_table: str, target_id: str, content: str) -> int:
-    """Enqueue a pending embedding job. Returns job id."""
-    cur = conn.execute(
-        "INSERT INTO embedding_jobs (target_table, target_id, content) VALUES (?,?,?)",
-        (target_table, target_id, content),
-    )
-    conn.commit()
-    return int(cur.lastrowid)
+    """Enqueue with a durable content-version snapshot in the same transaction."""
+    if target_table != "cold_memory":
+        raise ValueError("unsupported embedding target_table")
+    from .storage import atomic
+    with atomic(conn):
+        row = conn.execute(
+            "SELECT content, created_at, updated_at FROM cold_memory WHERE id=?", (target_id,),
+        ).fetchone()
+        if row is not None and row["content"] != content:
+            raise ValueError("enqueue content is stale")
+        cur = conn.execute(
+            "INSERT INTO embedding_jobs (target_table, target_id, content) VALUES (?,?,?)",
+            (target_table, target_id, content),
+        )
+        job_id = int(cur.lastrowid)
+        if row is not None:
+            conn.execute(
+                "INSERT INTO embedding_job_versions (job_id, created_at, updated_at) VALUES (?,?,?)",
+                (job_id, row["created_at"], row["updated_at"]),
+            )
+    return job_id
 
 
 def fetch_one_pending(conn: sqlite3.Connection) -> Optional[dict]:
@@ -87,7 +101,7 @@ def mark_failed(conn: sqlite3.Connection, job_id: int, error: str) -> None:
     conn.execute(
         "UPDATE embedding_jobs "
         "SET status='failed', attempts=attempts+1, last_error=?, updated_at=datetime('now') "
-        "WHERE id=?",
+        "WHERE id=? AND status='running'",
         (error[:500], job_id),
     )
     conn.commit()
@@ -123,6 +137,42 @@ def queue_stats(conn: sqlite3.Connection) -> dict:
         "SELECT status, COUNT(*) AS n FROM embedding_jobs GROUP BY status"
     ).fetchall()
     return {row["status"]: row["n"] for row in rows}
+
+
+def complete_job(storage, job: dict, vec: list[float]) -> bool:
+    """CAS validation, vector replacement and job completion are ONE commit.
+
+    Missing legacy version evidence is stale, not permission to overwrite.
+    Returns False for discarded jobs; failures roll back before mark_failed.
+    """
+    from .storage import atomic
+    conn = storage._get_conn()
+    with atomic(conn):
+        current = conn.execute("SELECT * FROM embedding_jobs WHERE id=?", (job["id"],)).fetchone()
+        if current is None or current["status"] != "running":
+            return False
+        version = conn.execute(
+            "SELECT created_at, updated_at FROM embedding_job_versions WHERE job_id=?", (job["id"],),
+        ).fetchone()
+        valid = current["target_table"] == "cold_memory" and version is not None and all(
+            current[k] == job[k] for k in ("target_table", "target_id", "content", "attempts")
+        )
+        expected = dict(version) if version else {}
+        expected["content"] = current["content"]
+        valid = valid and storage._entry_matches(current["target_id"], expected)
+        newer = conn.execute(
+            "SELECT 1 FROM embedding_jobs WHERE target_table=? AND target_id=? AND id>? LIMIT 1",
+            (current["target_table"], current["target_id"], job["id"]),
+        ).fetchone()
+        if valid and not newer:
+            storage.vec_store(current["target_id"], vec, expected=expected)
+        else:
+            valid = False
+        conn.execute(
+            "UPDATE embedding_jobs SET status='done', last_error=?, updated_at=datetime('now') WHERE id=?",
+            (None if valid else "stale job: target/content/version superseded or unverified", job["id"]),
+        )
+        return bool(valid)
 
 
 # ── Worker (async) ──
@@ -162,18 +212,7 @@ async def embedding_worker(engine, stop_event: asyncio.Event) -> None:
             vec = await asyncio.to_thread(get_embedding, job["content"])
             if not vec:
                 raise RuntimeError("get_embedding returned None/empty")
-            # Tag the embedding with the active provider's model so a later
-            # backend switch is auditable (e.g. nomic-embed-text vs copilot).
-            model_name = None
-            try:
-                from .embedding import get_provider
-                model_name = getattr(get_provider(), "model", None)
-            except Exception:
-                pass
-            # vec_store handles INSERT OR REPLACE; safe even if a manual backfill
-            # raced with us.
-            storage.vec_store(job["target_id"], vec, model=model_name)
-            mark_done(storage._get_conn(), job["id"])
+            complete_job(storage, job, vec)
         except Exception as e:
             logger.warning(
                 "worker: job %d (target=%s) failed (attempt %d): %s",

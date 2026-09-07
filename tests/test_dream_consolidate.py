@@ -30,7 +30,7 @@ def _seed_three(engine) -> list[str]:
         ids.append(r["id"])
         # near-identical embeddings → tight L2 cluster
         emb = [1.0 + i * 0.001] + [0.0] * 767
-        s.vec_store(r["id"], emb)
+        s.vec_store(r["id"], emb, model="synthetic-dream", space_id="synthetic-dream-768-v1")
     return ids
 
 

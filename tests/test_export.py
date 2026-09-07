@@ -186,9 +186,11 @@ class TestEmbeddingCompatibility:
     """Embedding backend compatibility detection."""
 
     def test_same_backend_compatible(self):
-        """Same backend → compatible, no reembed needed."""
+        """Same attested core space → compatible, no reembed needed."""
+        from openhippo.core import embedding
         backend = _get_embedding_backend_info()
-        header = {"embedding_backend": backend}
+        _, space_id = embedding.provider_identity(embedding._provider)
+        header = {"embedding_backend": backend, "embedding_space": space_id}
         result = check_embedding_compatibility(header)
         assert result["compatible"] is True
         assert result["reembed_needed"] is False

@@ -9,17 +9,20 @@ Threading model:
 import hashlib
 import json
 import logging
+import math
 import sqlite3
 import struct
 import threading
 import time
 import uuid
 from pathlib import Path
+from contextlib import contextmanager
 from typing import Any, Optional
 
 import sqlite_vec
 
 from .migrations_runner import run_migrations
+from .embedding import validate_vector
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +120,28 @@ def _content_hash(content: str) -> str:
     return hashlib.sha256(_normalize_content(content).encode()).hexdigest()
 
 
+@contextmanager
+def atomic(conn, *, write=True):
+    """Own only our transaction/savepoint; never commit a caller's work."""
+    nested = conn.in_transaction
+    name = "vector_" + uuid.uuid4().hex
+    conn.execute(f"SAVEPOINT {name}" if nested else ("BEGIN IMMEDIATE" if write else "BEGIN"))
+    try:
+        yield
+        conn.execute(f"RELEASE {name}" if nested else "COMMIT")
+    except BaseException:
+        if nested:
+            conn.execute(f"ROLLBACK TO {name}")
+            conn.execute(f"RELEASE {name}")
+        else:
+            conn.rollback()
+        raise
+
+
+class VectorSpaceError(ValueError):
+    """Unknown or incompatible provenance: do not infer compatibility."""
+
+
 class Storage:
     """SQLite + FTS5 + sqlite-vec storage layer (thread-safe via per-thread conns)."""
 
@@ -167,6 +192,33 @@ class Storage:
         conn.executescript(VECTOR_TABLE_SQL)
         conn.commit()
         applied = run_migrations(conn)
+        # Additive safety metadata only. Existing model labels/vectors are NEVER
+        # reclassified. Legacy rows without evidence remain unavailable to KNN.
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS embedding_spaces (
+                memory_id TEXT PRIMARY KEY REFERENCES cold_embeddings(memory_id) ON DELETE CASCADE,
+                space_id TEXT NOT NULL,
+                model TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_embedding_spaces_identity
+                ON embedding_spaces(model, space_id, memory_id);
+            CREATE INDEX IF NOT EXISTS idx_cold_embeddings_identity
+                ON cold_embeddings(model, memory_id);
+            CREATE TABLE IF NOT EXISTS embedding_space_adoptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model TEXT NOT NULL,
+                space_id TEXT NOT NULL,
+                evidence TEXT NOT NULL CHECK(length(trim(evidence)) > 0),
+                created_at REAL NOT NULL,
+                validated_count INTEGER NOT NULL,
+                adopted_count INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS embedding_job_versions (
+                job_id INTEGER PRIMARY KEY REFERENCES embedding_jobs(id) ON DELETE CASCADE,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+        """)
         if applied:
             logger.info("Applied %d schema migration(s)", applied)
 
@@ -511,20 +563,28 @@ class Storage:
 
     def cold_update(self, memory_id: str, content: str) -> dict:
         conn = self._get_conn()
-        row = conn.execute("SELECT id FROM cold_memory WHERE id=?", (memory_id,)).fetchone()
+        row = self.cold_get(memory_id)
         if not row:
             return {"error": f"Memory {memory_id} not found"}
-        chash = _content_hash(content)
-        conn.execute(
-            "UPDATE cold_memory SET content=?, content_hash=?, updated_at=unixepoch('now') WHERE id=?",
-            (content, chash, memory_id),
-        )
-        conn.commit()
         from .embedding import get_embedding
         vec = get_embedding(content)
-        if vec:
-            self.vec_delete(memory_id)
+        if vec is None:
+            raise ValueError("embedding failed; cold update was not committed")
+        with atomic(conn):
+            if not self._entry_matches(memory_id, row):
+                raise ValueError("cold entry changed during embedding; retry update")
+            version = max(time.time(), math.nextafter(float(row["updated_at"]), math.inf))
+            conn.execute(
+                "UPDATE cold_memory SET content=?, content_hash=?, updated_at=? WHERE id=?",
+                (content, _content_hash(content), version, memory_id),
+            )
             self.vec_store(memory_id, vec)
+            # Invalidate even same-text/ABA jobs in the SAME commit as the new vec.
+            conn.execute(
+                "UPDATE embedding_jobs SET status='done', last_error='superseded by cold_update', "
+                "updated_at=datetime('now') WHERE target_table='cold_memory' AND target_id=? "
+                "AND status != 'done'", (memory_id,),
+            )
         return {"id": memory_id, "status": "updated"}
 
     def cold_timeline(self, target: str | None = None, limit: int = 50, offset: int = 0,
@@ -755,36 +815,147 @@ class Storage:
 
     @staticmethod
     def _serialize_vec(vec: list[float]) -> bytes:
-        return struct.pack(f"<{len(vec)}f", *vec)
+        values = validate_vector(vec)
+        return struct.pack(f"<{len(values)}f", *values)
 
-    def vec_store(self, memory_id: str, embedding: list[float], model: Optional[str] = None) -> None:
+    @staticmethod
+    def _vector_identity(embedding, model=None, space_id=None):
+        tagged_model = getattr(embedding, "model", None)
+        tagged_space = getattr(embedding, "space_id", None)
+        if (model and tagged_model and model != tagged_model) or (
+            space_id and tagged_space and space_id != tagged_space
+        ):
+            raise VectorSpaceError("vector provenance conflicts with explicit metadata")
+        model, space_id = model or tagged_model, space_id or tagged_space
+        if not model or not space_id:
+            raise VectorSpaceError("vector requires explicit model AND space provenance")
+        return model, space_id
+
+    def _check_vector_space(self, conn, model, space_id):
+        # Hot path: ordinary indexed metadata ONLY, never a vec0/BLOB join.
+        # All supported vector writers maintain the three tables atomically.
+        # Full physical integrity is checked explicitly during legacy adoption;
+        # reading a query must not turn into an O(N^2) virtual-table audit.
+        bad = conn.execute("""
+            SELECT e.memory_id FROM cold_embeddings e INDEXED BY idx_cold_embeddings_identity
+            LEFT JOIN embedding_spaces s ON s.memory_id=e.memory_id
+            WHERE s.space_id IS NULL OR s.space_id != ? OR s.model != ?
+               OR e.model != s.model
+            UNION ALL
+            SELECT s.memory_id FROM embedding_spaces s
+            LEFT JOIN cold_embeddings e ON e.memory_id=s.memory_id
+            WHERE e.memory_id IS NULL
+            LIMIT 1
+        """, (space_id, model)).fetchone()
+        if bad:
+            raise VectorSpaceError("index has unknown/incompatible vector space; explicit migration required")
+
+    def _validate_legacy_vectors(self, conn, model, space_id):
+        """Full physical audit, only for explicit adoption (never query/startup).
+
+        Scan vec0 once and look up the ordinary table by its primary key, not
+        the reverse: vec0 equality joins can become quadratic. Compare the
+        original bytes, not reserialized or approximately equal vectors.
+        """
+        bad = conn.execute("""
+            SELECT e.memory_id FROM cold_embeddings e
+            LEFT JOIN cold_memory m ON m.id=e.memory_id
+            WHERE e.model != ? OR length(e.embedding) != 768 * 4 OR m.id IS NULL
+            UNION ALL
+            SELECT s.memory_id FROM embedding_spaces s
+            LEFT JOIN cold_embeddings e ON e.memory_id=s.memory_id
+            WHERE e.memory_id IS NULL OR s.model != ? OR s.space_id != ?
+            LIMIT 1
+        """, (model, model, space_id)).fetchone()
+        if bad:
+            raise VectorSpaceError("legacy adoption rejected: model, dimension, orphan or space conflict")
+        total = conn.execute("SELECT count(*) FROM cold_embeddings").fetchone()[0]
+        if not total:
+            raise VectorSpaceError("legacy adoption requires a nonempty vector corpus")
+        seen = set()
+        for row in conn.execute("SELECT memory_id, embedding FROM cold_memory_vec"):
+            mid, blob = row["memory_id"], row["embedding"]
+            stored = conn.execute(
+                "SELECT embedding FROM cold_embeddings WHERE memory_id=?", (mid,)
+            ).fetchone()
+            if mid in seen or stored is None or blob != stored[0]:
+                raise VectorSpaceError("legacy adoption rejected: vec0/blob orphan or byte mismatch")
+            # Reject invalid numerical payloads even if both copies match.
+            validate_vector(struct.unpack("<768f", blob))
+            seen.add(mid)
+        if len(seen) != total:
+            raise VectorSpaceError("legacy adoption rejected: missing vec0 rows")
+        return total
+
+    def adopt_legacy_space(self, model, space_id, evidence: str) -> dict:
+        """Explicit operator attestation; NEVER invoked automatically.
+
+        The caller supplies provenance evidence: structural consistency alone
+        cannot prove semantic compatibility. Only missing space metadata and a
+        separate audit record are inserted. Old rows/models/blobs/jobs remain
+        untouched. A fresh BEGIN IMMEDIATE prevents concurrent corpus changes;
+        reject caller transactions instead of silently weakening that contract.
+        """
+        if any(not isinstance(value, str) or not value.strip()
+               for value in (model, space_id, evidence)):
+            raise VectorSpaceError("adoption requires nonempty model, space_id and evidence strings")
         conn = self._get_conn()
-        blob = self._serialize_vec(embedding)
-        if model:
+        if conn.in_transaction:
+            raise VectorSpaceError("legacy adoption requires its own BEGIN IMMEDIATE transaction")
+        with atomic(conn):
+            total = self._validate_legacy_vectors(conn, model, space_id)
+            added = conn.execute("""
+                INSERT INTO embedding_spaces (memory_id, space_id, model)
+                SELECT e.memory_id, ?, ? FROM cold_embeddings e
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM embedding_spaces s WHERE s.memory_id=e.memory_id
+                )
+            """, (space_id, model)).rowcount
+            created_at = time.time()
+            audit_id = conn.execute("""
+                INSERT INTO embedding_space_adoptions
+                    (model, space_id, evidence, created_at, validated_count, adopted_count)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (model, space_id, evidence, created_at, total, added)).lastrowid
+        return {"audit_id": audit_id, "model": model, "space_id": space_id,
+                "validated_count": total, "adopted_count": added, "created_at": created_at}
+
+    def _entry_matches(self, memory_id, expected):
+        row = self.cold_get(memory_id)
+        return row is not None and all(
+            row[key] == expected[key] for key in ("content", "created_at", "updated_at")
+        )
+
+    def vec_store(self, memory_id: str, embedding: list[float], model: Optional[str] = None,
+                  *, space_id: str | None = None, expected: dict | None = None) -> None:
+        blob = self._serialize_vec(embedding)  # validate BEFORE any mutation
+        model, space_id = self._vector_identity(embedding, model, space_id)
+        conn = self._get_conn()
+        with atomic(conn):
+            if expected is not None and not self._entry_matches(memory_id, expected):
+                raise ValueError("stale embedding: cold content/version changed")
+            self._check_vector_space(conn, model, space_id)
             conn.execute(
-                "INSERT OR REPLACE INTO cold_embeddings (memory_id, embedding, model, created_at) VALUES (?,?,?,?)",
+                "INSERT INTO cold_embeddings (memory_id, embedding, model, created_at) VALUES (?,?,?,?) "
+                "ON CONFLICT(memory_id) DO UPDATE SET embedding=excluded.embedding, "
+                "model=excluded.model, created_at=excluded.created_at",
                 (memory_id, blob, model, time.time()),
             )
-        else:
+            # vec0 does not honor INSERT OR REPLACE. Keep delete+insert and
+            # provenance in ONE rollback boundary, including caller transactions.
+            conn.execute("DELETE FROM cold_memory_vec WHERE memory_id=?", (memory_id,))
+            conn.execute("INSERT INTO cold_memory_vec (memory_id, embedding) VALUES (?,?)", (memory_id, blob))
             conn.execute(
-                "INSERT OR REPLACE INTO cold_embeddings (memory_id, embedding, created_at) VALUES (?,?,?)",
-                (memory_id, blob, time.time()),
+                "INSERT INTO embedding_spaces (memory_id, space_id, model) VALUES (?,?,?) "
+                "ON CONFLICT(memory_id) DO UPDATE SET space_id=excluded.space_id, model=excluded.model",
+                (memory_id, space_id, model),
             )
-        # sqlite-vec (vec0) virtual tables do NOT honor INSERT OR REPLACE — a
-        # primary-key collision raises "UNIQUE constraint failed" instead of
-        # overwriting. Must DELETE the existing row first, then INSERT.
-        conn.execute("DELETE FROM cold_memory_vec WHERE memory_id=?", (memory_id,))
-        conn.execute(
-            "INSERT INTO cold_memory_vec (memory_id, embedding) VALUES (?,?)",
-            (memory_id, blob),
-        )
-        conn.commit()
 
     def vec_delete(self, memory_id: str) -> None:
         conn = self._get_conn()
-        conn.execute("DELETE FROM cold_embeddings WHERE memory_id=?", (memory_id,))
-        conn.execute("DELETE FROM cold_memory_vec WHERE memory_id=?", (memory_id,))
-        conn.commit()
+        with atomic(conn):
+            conn.execute("DELETE FROM cold_embeddings WHERE memory_id=?", (memory_id,))
+            conn.execute("DELETE FROM cold_memory_vec WHERE memory_id=?", (memory_id,))
 
     # L2 distance threshold for relevance filtering.
     # For nomic-embed-text (768d, normalized), empirically:
@@ -794,7 +965,24 @@ class Storage:
 
     def vec_search(self, query_embedding: list[float], target: str | None = None,
                    limit: int = 20, include_dormant: bool = False,
-                   origin: str | None = None) -> list[dict]:
+                   origin: str | None = None, *, model: str | None = None,
+                   space_id: str | None = None) -> list[dict]:
+        # Gate and retrieval share one read snapshot; a concurrent writer cannot
+        # change the corpus between the compatibility check and distance scan.
+        self._serialize_vec(query_embedding)
+        conn = self._get_conn()
+        try:
+            model, space_id = self._vector_identity(query_embedding, model, space_id)
+            with atomic(conn, write=False):
+                self._check_vector_space(conn, model, space_id)
+                return self._vec_search_checked(query_embedding, target, limit, include_dormant, origin)
+        except VectorSpaceError as exc:
+            logger.warning("Vector search disabled: %s", exc)
+            return []
+
+    def _vec_search_checked(self, query_embedding: list[float], target: str | None = None,
+                            limit: int = 20, include_dormant: bool = False,
+                            origin: str | None = None) -> list[dict]:
         """Pure KNN vector search.
 
         ⚠️ Known limitation: when ``origin`` is set, filtering happens AFTER

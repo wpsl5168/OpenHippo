@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
+import struct
 import threading
 import urllib.error
 import urllib.request
@@ -25,25 +27,73 @@ _cache_lock = threading.Lock()
 _cache_stats = {"hits": 0, "misses": 0}
 
 
-def _cache_key(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+class EmbeddingVector(list):
+    """List-compatible vector with the provenance captured BEFORE inference."""
+
+    def __init__(self, values, *, model: str, space_id: str):
+        super().__init__(values)
+        self.model = model
+        self.space_id = space_id
+
+    def copy(self):
+        return EmbeddingVector(self, model=self.model, space_id=self.space_id)
 
 
-def _cache_get(text: str) -> Optional[list[float]]:
-    key = _cache_key(text)
+def validate_vector(vec, dimension: int = EMBEDDING_DIM) -> list[float]:
+    """Reject malformed/non-finite vectors, including float32 overflow."""
+    if not isinstance(vec, (list, tuple)) or len(vec) != dimension:
+        raise ValueError(f"embedding must contain exactly {dimension} values")
+    try:
+        if any(isinstance(x, (bool, str, bytes)) for x in vec):
+            raise ValueError("embedding values must be numbers")
+        values = [float(x) for x in vec]
+        if not all(math.isfinite(x) for x in values):
+            raise ValueError("embedding contains non-finite values")
+        packed = struct.pack(f"<{dimension}f", *values)
+        if not all(math.isfinite(x) for x in struct.unpack(f"<{dimension}f", packed)):
+            raise ValueError("embedding overflows float32")
+        return values
+    except (TypeError, OverflowError, struct.error) as exc:
+        raise ValueError("embedding values must be finite float32 numbers") from exc
+
+
+def provider_identity(provider) -> tuple[str, str]:
+    model = getattr(provider, "model", None) or getattr(provider, "_model_name", None)
+    if not isinstance(model, str) or not model:
+        raise ValueError("embedding provider must declare a model")
+    # Endpoint, backend implementation and preprocessing are part of the space;
+    # identical dimensions/model names alone are NOT compatibility evidence.
+    descriptor = {
+        "provider": f"{type(provider).__module__}.{type(provider).__qualname__}",
+        "model": model,
+        "endpoint": getattr(provider, "base_url", "").rstrip("/"),
+        "dimension": provider.dimension,
+        "preprocessing": getattr(provider, "space_revision", "openhippo-v1"),
+        "max_prompt_chars": getattr(provider, "MAX_PROMPT_CHARS", None),
+    }
+    space_id = "v1:" + hashlib.sha256(json.dumps(descriptor, sort_keys=True).encode()).hexdigest()
+    return model, space_id
+
+
+def _cache_key(text: str, space_id: str) -> str:
+    return hashlib.sha256((space_id + "\0" + text).encode("utf-8")).hexdigest()
+
+
+def _cache_get(text: str, space_id: str) -> Optional[list[float]]:
+    key = _cache_key(text, space_id)
     with _cache_lock:
         if key in _cache:
             _cache.move_to_end(key)
             _cache_stats["hits"] += 1
-            return _cache[key]
+            return _cache[key].copy()
         _cache_stats["misses"] += 1
         return None
 
 
 def _cache_put(text: str, vec: list[float]) -> None:
-    key = _cache_key(text)
+    key = _cache_key(text, vec.space_id)
     with _cache_lock:
-        _cache[key] = vec
+        _cache[key] = vec.copy()
         _cache.move_to_end(key)
         while len(_cache) > _CACHE_CAPACITY:
             _cache.popitem(last=False)
@@ -94,8 +144,8 @@ class CopilotProvider(EmbeddingProvider):
 
     Field-verified quirks (2026-07):
     - ``input`` MUST be a JSON array; a bare string returns HTTP 400.
-    - ``dimensions=768`` truncates the native 1536-dim vector (Matryoshka) so it
-      stays compatible with the existing sqlite-vec float[768] store.
+    - ``dimensions=768`` fits the sqlite-vec float[768] SHAPE only; it does
+      not establish compatibility with an existing model's vector space.
     - Editor headers (Copilot-Integration-Id etc.) are required for auth.
     """
 
@@ -164,14 +214,13 @@ class CopilotProvider(EmbeddingProvider):
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 data = json.loads(resp.read())
-            items = sorted(data.get("data", []), key=lambda d: d.get("index", 0))
+            items = sorted(data.get("data", []), key=lambda d: d["index"])
+            if [it["index"] for it in items] != list(range(len(texts))):
+                raise ValueError("embedding response has missing/duplicate/out-of-range indices")
             out: list[Optional[list[float]]] = []
             for it in items:
                 vec = it.get("embedding")
-                out.append(_l2_normalize(vec) if vec and len(vec) == self.dimensions else (vec or None))
-            # Pad if the API returned fewer than requested (shouldn't happen)
-            while len(out) < len(texts):
-                out.append(None)
+                out.append(_l2_normalize(validate_vector(vec, self.dimension)))
             return out
         except urllib.error.HTTPError as e:
             body = ""
@@ -235,7 +284,7 @@ class OllamaProvider(EmbeddingProvider):
             if vec and len(vec) == self.dimension:
                 return _l2_normalize(vec)
             logger.warning("Unexpected dim: %d (expected %d)", len(vec) if vec else 0, self.dimension)
-            return vec if vec else None
+            return None
 
     def embed(self, text: str) -> Optional[list[float]]:
         if not text:
@@ -292,9 +341,9 @@ class SentenceTransformerProvider(EmbeddingProvider):
             prefixed = f"search_document: {text}" if "nomic" in self._model_name else text
             vec = model.encode(prefixed, normalize_embeddings=True).tolist()
             if len(vec) == self.dimension:
-                return vec
+                return validate_vector(vec, self.dimension)
             logger.warning("Unexpected dim: %d (expected %d)", len(vec), self.dimension)
-            return vec
+            return None
         except ImportError:
             raise
         except Exception as e:
@@ -307,7 +356,7 @@ class SentenceTransformerProvider(EmbeddingProvider):
             prefix = "search_document: " if "nomic" in self._model_name else ""
             prefixed = [f"{prefix}{t}" for t in texts]
             vecs = model.encode(prefixed, normalize_embeddings=True, batch_size=32)
-            return [v.tolist() for v in vecs]
+            return [validate_vector(v.tolist(), self.dimension) for v in vecs]
         except Exception as e:
             logger.warning("Batch embedding failed: %s", e)
             return [self.embed(t) for t in texts]
@@ -391,36 +440,55 @@ def _create_default_provider() -> EmbeddingProvider:
 
 # ── Backward-compatible convenience functions ──
 
-def get_embedding(text: str) -> Optional[list[float]]:
+def get_embedding(text: str, *, provider=None) -> Optional[list[float]]:
     """Get embedding vector with LRU cache. Uses the configured provider."""
     if not text:
         return None
-    cached = _cache_get(text)
+    provider = provider if provider is not None else get_provider()
+    model, space_id = provider_identity(provider)
+    cached = _cache_get(text, space_id)
     if cached is not None:
         return cached
-    vec = get_provider().embed(text)
+    vec = provider.embed(text)
     if vec is not None:
+        try:
+            vec = EmbeddingVector(validate_vector(vec, provider.dimension), model=model, space_id=space_id)
+            if provider_identity(provider) != (model, space_id):
+                raise ValueError("provider configuration changed during inference")
+        except ValueError as exc:
+            logger.warning("Invalid embedding: %s", exc)
+            return None
         _cache_put(text, vec)
     return vec
 
 
 def get_embeddings_batch(texts: list[str]) -> list[Optional[list[float]]]:
     """Get embeddings for multiple texts with LRU cache."""
+    provider = get_provider()
+    model, space_id = provider_identity(provider)
     results: list[Optional[list[float]]] = [None] * len(texts)
     miss_idx: list[int] = []
     miss_texts: list[str] = []
     for i, t in enumerate(texts):
         if not t:
             continue
-        cached = _cache_get(t)
+        cached = _cache_get(t, space_id)
         if cached is not None:
             results[i] = cached
         else:
             miss_idx.append(i)
             miss_texts.append(t)
     if miss_texts:
-        fresh = get_provider().embed_batch(miss_texts)
+        fresh = provider.embed_batch(miss_texts)
+        if len(fresh) != len(miss_texts) or provider_identity(provider) != (model, space_id):
+            logger.warning("Invalid embedding batch size/provider change")
+            return results
         for j, vec in zip(miss_idx, fresh):
+            if vec is not None:
+                try:
+                    vec = EmbeddingVector(validate_vector(vec, provider.dimension), model=model, space_id=space_id)
+                except ValueError:
+                    vec = None
             results[j] = vec
             if vec is not None:
                 _cache_put(texts[j], vec)
@@ -430,7 +498,8 @@ def get_embeddings_batch(texts: list[str]) -> list[Optional[list[float]]]:
 # ── Utility ──
 
 def _l2_normalize(vec: list[float]) -> list[float]:
-    norm = sum(x * x for x in vec) ** 0.5
+    vec = validate_vector(vec, len(vec))
+    norm = math.hypot(*vec)
     if norm > 0:
         return [x / norm for x in vec]
     return vec
